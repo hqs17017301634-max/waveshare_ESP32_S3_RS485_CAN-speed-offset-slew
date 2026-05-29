@@ -1,83 +1,101 @@
 #include <SPI.h>
 #include <mcp2515.h>
 
-#define CAN_CS    9    // GPIO9 片选
+constexpr uint8_t CAN_CS_PIN = 9;
+constexpr uint8_t SPI1_RX_PIN = 12;
+constexpr uint8_t SPI1_TX_PIN = 11;
+constexpr uint8_t SPI1_SCK_PIN = 10;
+constexpr uint32_t MCP_CLOCK_HZ = 10000000;
 
+constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
+constexpr uint32_t CAN_ID_FSD_CONTROL = 1021;
 
-MCP2515* mcp = nullptr;
+constexpr uint8_t MUX_MASK = 0x07;
+constexpr uint8_t FOLLOW_DISTANCE_MASK = 0b11100000;
+constexpr uint8_t FOLLOW_DISTANCE_SHIFT = 5;
+constexpr uint8_t SPEED_PROFILE_MASK = 0x06;
+constexpr uint8_t SPEED_PROFILE_SHIFT = 1;
+
+MCP2515 mcp(CAN_CS_PIN, MCP_CLOCK_HZ, &SPI1);
 
 struct HW3Handler {
-  int speedProfile = 1;
-  
-  void handelMessage(can_frame& frame) {
-    // 处理跟车距离 → 速度曲线切换
-    if (frame.can_id == 1016) {
-      uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
-      switch (followDistance) {
-        case 1: speedProfile = 2; break;
-        case 2: speedProfile = 1; break;
-        case 3: speedProfile = 0; break;
-        default: break;
-      }
+  uint8_t speedProfile = 1;
+
+  void handleMessage(can_frame& frame) {
+    if (frame.can_id == CAN_ID_FOLLOW_DISTANCE) {
+      updateSpeedProfile(frame);
       return;
     }
-    
-    // 处理 FSD 相关消息（1021）
-    if (frame.can_id == 1021) {
-      auto index = frame.data[0] & 0x07;
-      
-      // index == 0 时修改速度曲线并转发
-      if (index == 0) {
-        frame.data[5] |= (1 << 6);           // 使能某标志位
-        frame.data[6] &= ~0x06;              // 清零速度曲线位
-        frame.data[6] |= (speedProfile << 1); // 写入当前速度曲线
-        
-        mcp->sendMessage(&frame);
-      }
-      
-      // index == 1 时直接转发（去掉某个bit）
-      if (index == 1) {
-        frame.data[2] &= ~(1 << 3);
-        mcp->sendMessage(&frame);
-      }
-      
-      // index == 2 时不再处理速度偏移，直接跳过（已精简）
+
+    if (frame.can_id != CAN_ID_FSD_CONTROL) return;
+
+    switch (readMux(frame)) {
+      case 0:
+        enableFsdSpeedProfile(frame);
+        mcp.sendMessage(&frame);
+        break;
+      case 1:
+        suppressControlFlag(frame);
+        mcp.sendMessage(&frame);
+        break;
+      default:
+        break;
     }
+  }
+
+private:
+  static uint8_t readMux(const can_frame& frame) {
+    return frame.data[0] & MUX_MASK;
+  }
+
+  void updateSpeedProfile(const can_frame& frame) {
+    const uint8_t followDistance =
+      (frame.data[5] & FOLLOW_DISTANCE_MASK) >> FOLLOW_DISTANCE_SHIFT;
+
+    switch (followDistance) {
+      case 1: speedProfile = 2; break;
+      case 2: speedProfile = 1; break;
+      case 3: speedProfile = 0; break;
+      default: break;
+    }
+  }
+
+  void enableFsdSpeedProfile(can_frame& frame) const {
+    frame.data[5] |= (1U << 6);
+    frame.data[6] = (frame.data[6] & static_cast<uint8_t>(~SPEED_PROFILE_MASK)) |
+                    ((speedProfile << SPEED_PROFILE_SHIFT) & SPEED_PROFILE_MASK);
+  }
+
+  static void suppressControlFlag(can_frame& frame) {
+    frame.data[2] &= static_cast<uint8_t>(~(1U << 3));
   }
 };
 
 HW3Handler handler;
 
 void setup() {
-  delay(1500);
-  Serial.begin(115200);
-  unsigned long t0 = millis();
-  while (!Serial && millis() - t0 < 1000) {}
+  delay(500);
 
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  SPI1.setRX(12);
-  SPI1.setTX(11);
-  SPI1.setSCK(10);
+  SPI1.setRX(SPI1_RX_PIN);
+  SPI1.setTX(SPI1_TX_PIN);
+  SPI1.setSCK(SPI1_SCK_PIN);
   SPI1.begin();
 
-  mcp = new MCP2515(CAN_CS, 10000000, &SPI1);
-
-  if (mcp) {
-    mcp->reset();
-    MCP2515::ERROR e = mcp->setBitrate(CAN_500KBPS, MCP_16MHZ);
-    mcp->setNormalMode();
-  }
+  mcp.reset();
+  mcp.setBitrate(CAN_500KBPS, MCP_16MHZ);
+  mcp.setNormalMode();
 }
+
 __attribute__((optimize("O3"))) void loop() {
-  if (!mcp) return;
-  
   can_frame frame;
-  if (mcp->readMessage(&frame) == MCP2515::ERROR_OK) {
-    digitalWrite(PIN_LED, LOW);
-    handler.handelMessage(frame);
-  } else {
+  if (mcp.readMessage(&frame) != MCP2515::ERROR_OK) {
     digitalWrite(PIN_LED, HIGH);
+    return;
   }
+
+  digitalWrite(PIN_LED, LOW);
+  handler.handleMessage(frame);
 }
