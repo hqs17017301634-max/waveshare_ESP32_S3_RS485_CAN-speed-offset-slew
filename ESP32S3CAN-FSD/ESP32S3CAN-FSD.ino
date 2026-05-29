@@ -11,15 +11,12 @@
     Only stable CAN messaging + FSD activation / speed control is kept.
 */
 
-#include <memory>
+#include <algorithm>
 #include <cstring>
 #include <driver/twai.h>
 
 // This build supports the HW3 car only.
-#define HW HW3Handler
 
-bool enablePrint = false;
-bool enableSpeedLimitPrint = false;
 bool enableAutoOffsetFromFusedSpeedLimit = true;
 bool enableFixedOffsetRawTest = false;
 
@@ -78,10 +75,7 @@ static bool twai_recv(can_frame& frame) {
 
 // ---- CAN IDs ----
 
-constexpr uint32_t CAN_ID_UI_DRIVER_ASSIST_MAP_DATA = 0x238;
-constexpr uint32_t CAN_ID_UI_GPS_VEHICLE_SPEED = 0x3D9;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
-constexpr uint32_t CAN_ID_DAS_STATUS2 = 0x389;
 
 // ---- Unified speed compensation ----
 
@@ -90,16 +84,6 @@ struct UnifiedSpeedCompensationPort {
   int fusedSpeedLimitMph = 0;
   int targetSpeedMph = 0;
   int offsetMph = 0;
-};
-
-struct CarManagerBase {
-  int speedProfile = 1;
-  bool FSDEnabled = true;
-  int fallbackSpeedOffsetMph = 0;
-  UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
-  virtual void handelMessage(can_frame& frame);
-  void setFallbackSpeedOffsetMph(int offsetMph);
-  void refreshUnifiedSpeedCompensation();
 };
 
 struct SpeedLimitMonitor {
@@ -155,32 +139,37 @@ inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
   return fusedSpeedLimitValue;
 }
 
-inline void CarManagerBase::setFallbackSpeedOffsetMph(int offsetMph) {
-  fallbackSpeedOffsetMph = offsetMph;
-}
+// ---- HW3 car handler ----
 
-inline void CarManagerBase::refreshUnifiedSpeedCompensation() {
-  unifiedSpeedCompensation.hasFusedSpeedLimit = false;
-  if (enableAutoOffsetFromFusedSpeedLimit) {
-    int fusedSpeedLimitValue = 0;
-    if (speedLimitMonitor.getFusedSpeedLimitValue(fusedSpeedLimitValue)) {
-      unifiedSpeedCompensation.hasFusedSpeedLimit = true;
-      unifiedSpeedCompensation.fusedSpeedLimitMph = fusedSpeedLimitValue;
-      unifiedSpeedCompensation.targetSpeedMph = getTargetSpeedForLimit(fusedSpeedLimitValue);
-      int desiredOffsetMph = unifiedSpeedCompensation.targetSpeedMph > fusedSpeedLimitValue
-        ? (unifiedSpeedCompensation.targetSpeedMph - fusedSpeedLimitValue)
-        : 0;
-      unifiedSpeedCompensation.offsetMph = clampOffsetMph(desiredOffsetMph);
-      return;
-    }
+struct HW3Handler {
+  int speedProfile = 1;
+  bool FSDEnabled = true;
+  int fallbackSpeedOffsetMph = 0;
+  UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
+
+  void setFallbackSpeedOffsetMph(int offsetMph) {
+    fallbackSpeedOffsetMph = offsetMph;
   }
-  unifiedSpeedCompensation.offsetMph = clampOffsetMph(fallbackSpeedOffsetMph);
-}
 
-// ---- Car-specific handlers ----
+  void refreshUnifiedSpeedCompensation() {
+    unifiedSpeedCompensation.hasFusedSpeedLimit = false;
+    if (enableAutoOffsetFromFusedSpeedLimit) {
+      int fusedSpeedLimitValue = 0;
+      if (speedLimitMonitor.getFusedSpeedLimitValue(fusedSpeedLimitValue)) {
+        unifiedSpeedCompensation.hasFusedSpeedLimit = true;
+        unifiedSpeedCompensation.fusedSpeedLimitMph = fusedSpeedLimitValue;
+        unifiedSpeedCompensation.targetSpeedMph = getTargetSpeedForLimit(fusedSpeedLimitValue);
+        int desiredOffsetMph = unifiedSpeedCompensation.targetSpeedMph > fusedSpeedLimitValue
+          ? (unifiedSpeedCompensation.targetSpeedMph - fusedSpeedLimitValue)
+          : 0;
+        unifiedSpeedCompensation.offsetMph = clampOffsetMph(desiredOffsetMph);
+        return;
+      }
+    }
+    unifiedSpeedCompensation.offsetMph = clampOffsetMph(fallbackSpeedOffsetMph);
+  }
 
-struct HW3Handler : public CarManagerBase {
-  virtual void handelMessage(can_frame& frame) override {
+  void handelMessage(can_frame& frame) {
     if (frame.can_id == 1016) {
       uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
       switch (followDistance) {
@@ -220,7 +209,7 @@ struct HW3Handler : public CarManagerBase {
 
 // ---- Main ----
 
-std::unique_ptr<CarManagerBase> handler;
+HW3Handler handler;
 
 void setup() {
   pinMode(PIN_LED, OUTPUT);
@@ -239,8 +228,6 @@ void setup() {
 
   twai_driver_install(&g_config, &t_config, &f_config);
   twai_start();
-
-  handler = std::make_unique<HW>();
 }
 
 void loop() {
@@ -251,6 +238,6 @@ void loop() {
   }
   digitalWrite(PIN_LED, LOW);
   speedLimitMonitor.update(frame);
-  handler->refreshUnifiedSpeedCompensation();
-  handler->handelMessage(frame);
+  handler.refreshUnifiedSpeedCompensation();
+  handler.handelMessage(frame);
 }
