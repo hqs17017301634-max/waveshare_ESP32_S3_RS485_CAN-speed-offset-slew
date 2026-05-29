@@ -49,6 +49,20 @@ constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3S
 constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
 constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 15;
 constexpr uint8_t FIXED_OFFSET_TEST_RAW = 40;
+constexpr uint32_t TWAI_ALERT_MASK =
+  TWAI_ALERT_BUS_OFF |
+  TWAI_ALERT_BUS_RECOVERED |
+  TWAI_ALERT_RECOVERY_IN_PROGRESS |
+  TWAI_ALERT_ERR_PASS |
+  TWAI_ALERT_BUS_ERROR |
+  TWAI_ALERT_TX_FAILED |
+  TWAI_ALERT_RX_QUEUE_FULL |
+  TWAI_ALERT_RX_FIFO_OVERRUN;
+constexpr uint32_t TWAI_TX_WAIT_MS = 5;
+constexpr uint32_t TWAI_RX_WAIT_MS = 1;
+constexpr uint32_t TWAI_TX_RETRY_DELAY_MS = 1;
+constexpr uint8_t TWAI_TX_RETRY_COUNT = 1;
+constexpr uint8_t TWAI_RX_SCAN_LIMIT = 8;
 
 // ---- CAN frame abstraction (mirrors RP2040 can_frame for handler compatibility) ----
 
@@ -58,26 +72,111 @@ struct can_frame {
   uint8_t  data[8];
 };
 
+static bool twaiRecoveryInProgress = false;
+
+static bool isRelevantCanId(uint32_t canId);
+static void serviceTwaiAlerts();
+
 static bool twai_send(const can_frame& frame) {
+  if (frame.can_dlc > 8) return false;
+
   twai_message_t msg = {};
   msg.identifier = frame.can_id;
   msg.data_length_code = frame.can_dlc;
-  memcpy(msg.data, frame.data, 8);
-  return twai_transmit(&msg, pdMS_TO_TICKS(5)) == ESP_OK;
+  memcpy(msg.data, frame.data, frame.can_dlc);
+
+  for (uint8_t attempt = 0; attempt <= TWAI_TX_RETRY_COUNT; ++attempt) {
+    serviceTwaiAlerts();
+    if (twaiRecoveryInProgress) return false;
+
+    if (twai_transmit(&msg, pdMS_TO_TICKS(TWAI_TX_WAIT_MS)) == ESP_OK) {
+      return true;
+    }
+
+    serviceTwaiAlerts();
+    if (attempt < TWAI_TX_RETRY_COUNT) delay(TWAI_TX_RETRY_DELAY_MS);
+  }
+  return false;
 }
 
 static bool twai_recv(can_frame& frame) {
   twai_message_t msg;
-  if (twai_receive(&msg, 0) != ESP_OK) return false;
-  frame.can_id  = msg.identifier;
-  frame.can_dlc = msg.data_length_code;
-  memcpy(frame.data, msg.data, 8);
-  return true;
+
+  for (uint8_t i = 0; i < TWAI_RX_SCAN_LIMIT; ++i) {
+    TickType_t waitTicks = (i == 0) ? pdMS_TO_TICKS(TWAI_RX_WAIT_MS) : 0;
+    if (twai_receive(&msg, waitTicks) != ESP_OK) return false;
+    if (msg.extd || msg.rtr || msg.data_length_code > 8 || !isRelevantCanId(msg.identifier)) {
+      continue;
+    }
+
+    frame.can_id  = msg.identifier;
+    frame.can_dlc = msg.data_length_code;
+    memset(frame.data, 0, sizeof(frame.data));
+    memcpy(frame.data, msg.data, frame.can_dlc);
+    return true;
+  }
+  return false;
+}
+
+static void serviceTwaiAlerts() {
+  uint32_t alerts = 0;
+  if (twai_read_alerts(&alerts, 0) == ESP_OK) {
+    if (alerts & TWAI_ALERT_BUS_OFF) {
+      if (!twaiRecoveryInProgress) {
+        twaiRecoveryInProgress = true;
+        twai_initiate_recovery();
+      }
+      return;
+    }
+
+    if (alerts & TWAI_ALERT_RECOVERY_IN_PROGRESS) {
+      twaiRecoveryInProgress = true;
+      return;
+    }
+
+    if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+      twaiRecoveryInProgress = twai_start() != ESP_OK;
+      return;
+    }
+  }
+
+  twai_status_info_t statusInfo = {};
+  if (twai_get_status_info(&statusInfo) != ESP_OK) return;
+
+  if (statusInfo.state == TWAI_STATE_BUS_OFF) {
+    if (!twaiRecoveryInProgress) {
+      twaiRecoveryInProgress = true;
+      twai_initiate_recovery();
+    }
+    return;
+  }
+
+  if (statusInfo.state == TWAI_STATE_RECOVERING) {
+    twaiRecoveryInProgress = true;
+    return;
+  }
+
+  if (twaiRecoveryInProgress && statusInfo.state == TWAI_STATE_STOPPED) {
+    twaiRecoveryInProgress = twai_start() != ESP_OK;
+    return;
+  }
+
+  if (statusInfo.state == TWAI_STATE_RUNNING) {
+    twaiRecoveryInProgress = false;
+  }
 }
 
 // ---- CAN IDs ----
 
+constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
+constexpr uint32_t CAN_ID_AP_CONTROL = 1021;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
+
+static inline bool isRelevantCanId(uint32_t canId) {
+  return canId == CAN_ID_DAS_STATUS ||
+         canId == CAN_ID_FOLLOW_DISTANCE ||
+         canId == CAN_ID_AP_CONTROL;
+}
 
 // ---- Unified speed compensation ----
 
@@ -94,14 +193,14 @@ struct SpeedLimitMonitor {
   bool hasDasStatusFrame = false;
 
   void update(const can_frame& frame) {
-    if (frame.can_id == CAN_ID_DAS_STATUS) {
+    if (frame.can_id == CAN_ID_DAS_STATUS && frame.can_dlc >= 2) {
       dasStatusFrame = frame;
       hasDasStatusFrame = true;
     }
   }
 
   bool getFusedSpeedLimitValue(int& limitValue) const {
-    if (!hasDasStatusFrame) return false;
+    if (!hasDasStatusFrame || dasStatusFrame.can_dlc < 2) return false;
     const uint64_t fusedLimitRaw = (static_cast<uint64_t>(dasStatusFrame.data[1]) & 0x1F);
     if (fusedLimitRaw == 0 || fusedLimitRaw == 31) return false;
     limitValue = static_cast<int>(fusedLimitRaw * 5ULL);
@@ -215,7 +314,8 @@ struct HW3Handler {
   }
 
   void handelMessage(can_frame& frame) {
-    if (frame.can_id == 1016) {
+    if (frame.can_id == CAN_ID_FOLLOW_DISTANCE) {
+      if (frame.can_dlc < 6) return;
       uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
       switch (followDistance) {
         case 1: speedProfile = 2; break;
@@ -224,7 +324,8 @@ struct HW3Handler {
       }
       return;
     }
-    if (frame.can_id == 1021) {
+    if (frame.can_id == CAN_ID_AP_CONTROL) {
+      if (frame.can_dlc < 8) return;
       auto index = readMuxID(frame);
       if (index == 0 && FSDEnabled) {
         int offsetRaw = (frame.data[3] >> 1) & 0x3F;
@@ -274,9 +375,11 @@ void setup() {
 
   twai_driver_install(&g_config, &t_config, &f_config);
   twai_start();
+  twai_reconfigure_alerts(TWAI_ALERT_MASK, nullptr);
 }
 
 void loop() {
+  serviceTwaiAlerts();
   can_frame frame;
   if (!twai_recv(frame)) {
     digitalWrite(PIN_LED, HIGH);
