@@ -1,0 +1,22 @@
+# Arduino/RP2040 build artifacts
+build/
+*.elf
+*.bin
+*.uf2
+*.map
+*.hex
+*.eep
+*.lst
+*.o
+*.d
+
+# Local archives/backups
+*.zip
+*.7z
+*.rar
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
