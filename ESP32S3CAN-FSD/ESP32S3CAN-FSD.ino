@@ -15,15 +15,8 @@
 #include <cstring>
 #include <driver/twai.h>
 
-#define HW3 // for what car to compile: HW4, HW3, or LEGACY
-
-#if defined(HW4)
-#define HW HW4Handler
-#elif defined(HW3)
+// This build supports the HW3 car only.
 #define HW HW3Handler
-#elif defined(LEGACY)
-#define HW LegacyHandler
-#endif
 
 bool enablePrint = false;
 bool enableSpeedLimitPrint = false;
@@ -49,9 +42,6 @@ bool enableFixedOffsetRawTest = false;
 #ifndef TWAI_TX_QUEUE_LEN
 #define TWAI_TX_QUEUE_LEN 16
 #endif
-
-#define ENABLE_APPROACHING_EMERGENCY_VEHICLE_DETECTION true
-#define ENABLE_ISA_SPEED_CHIME_SUPPRESS false
 
 constexpr int AUTO_TARGET_SPEED = 60;
 constexpr int AUTO_TARGET_SPEED_AT_80 = 80;
@@ -189,30 +179,6 @@ inline void CarManagerBase::refreshUnifiedSpeedCompensation() {
 
 // ---- Car-specific handlers ----
 
-struct LegacyHandler : public CarManagerBase {
-  virtual void handelMessage(can_frame& frame) override {
-    if (frame.can_id == 69) {
-      uint8_t pos = frame.data[1] >> 5;
-      if (pos <= 1) speedProfile = 2;
-      else if (pos == 2) speedProfile = 1;
-      else speedProfile = 0;
-      return;
-    }
-    if (frame.can_id == 1006) {
-      auto index = readMuxID(frame);
-      if (index == 0 && FSDEnabled) {
-        setBit(frame, 46, true);
-        setSpeedProfileV12V13(frame, speedProfile);
-        twai_send(frame);
-      }
-      if (index == 1) {
-        setBit(frame, 19, false);
-        twai_send(frame);
-      }
-    }
-  }
-};
-
 struct HW3Handler : public CarManagerBase {
   virtual void handelMessage(can_frame& frame) override {
     if (frame.can_id == 1016) {
@@ -246,49 +212,6 @@ struct HW3Handler : public CarManagerBase {
         frame.data[1] &= ~(0b00111111);
         frame.data[0] |= (speedOffsetRaw & 0x03) << 6;
         frame.data[1] |= (speedOffsetRaw >> 2);
-        twai_send(frame);
-      }
-    }
-  }
-};
-
-struct HW4Handler : public CarManagerBase {
-  virtual void handelMessage(can_frame& frame) override {
-    if (ENABLE_ISA_SPEED_CHIME_SUPPRESS && frame.can_id == 921) {
-      frame.data[1] |= 0x20;
-      uint8_t sum = 0;
-      for (int i = 0; i < 7; i++) sum += frame.data[i];
-      sum += (921 & 0xFF) + (921 >> 8);
-      frame.data[7] = sum & 0xFF;
-      twai_send(frame);
-      return;
-    }
-    if (frame.can_id == 1016) {
-      auto fd = (frame.data[5] & 0b11100000) >> 5;
-      switch (fd) {
-        case 1: speedProfile = 3; break;
-        case 2: speedProfile = 2; break;
-        case 3: speedProfile = 1; break;
-        case 4: speedProfile = 0; break;
-        case 5: speedProfile = 4; break;
-      }
-    }
-    if (frame.can_id == 1021) {
-      auto index = readMuxID(frame);
-      if (index == 0 && FSDEnabled) {
-        setBit(frame, 46, true);
-        setBit(frame, 60, true);
-        if (ENABLE_APPROACHING_EMERGENCY_VEHICLE_DETECTION) setBit(frame, 59, true);
-        twai_send(frame);
-      }
-      if (index == 1) {
-        setBit(frame, 19, false);
-        setBit(frame, 47, true);
-        twai_send(frame);
-      }
-      if (index == 2) {
-        frame.data[7] &= ~(0x07 << 4);
-        frame.data[7] |= (speedProfile & 0x07) << 4;
         twai_send(frame);
       }
     }
