@@ -44,8 +44,8 @@ constexpr int AUTO_TARGET_SPEED = 60;
 constexpr int AUTO_TARGET_SPEED_AT_80 = 80;
 constexpr int AUTO_TARGET_SPEED_AT_100 = 100;
 constexpr int AUTO_TARGET_SPEED_AT_120 = 120;
-constexpr int SPEED_OFFSET_RAW_PER_MPH = 10;
-constexpr int MAX_SPEED_OFFSET_MPH = 25;
+constexpr int MAX_SPEED_OFFSET_MPH = 25;     // absolute pre-clamp on the computed offset
+constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
 constexpr uint8_t FIXED_OFFSET_TEST_RAW = 40;
 
 // ---- CAN frame abstraction (mirrors RP2040 can_frame for handler compatibility) ----
