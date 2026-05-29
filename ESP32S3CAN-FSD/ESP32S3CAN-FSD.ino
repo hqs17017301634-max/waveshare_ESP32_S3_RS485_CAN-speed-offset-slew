@@ -44,8 +44,10 @@ constexpr int AUTO_TARGET_SPEED = 60;
 constexpr int AUTO_TARGET_SPEED_AT_80 = 80;
 constexpr int AUTO_TARGET_SPEED_AT_100 = 100;
 constexpr int AUTO_TARGET_SPEED_AT_120 = 120;
-constexpr int MAX_SPEED_OFFSET_MPH = 25;     // absolute pre-clamp on the computed offset
+constexpr int MAX_SPEED_OFFSET_KPH = 25;     // absolute pre-clamp on the computed offset
 constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
+constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
+constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 15;
 constexpr uint8_t FIXED_OFFSET_TEST_RAW = 40;
 
 // ---- CAN frame abstraction (mirrors RP2040 can_frame for handler compatibility) ----
@@ -81,9 +83,10 @@ constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
 
 struct UnifiedSpeedCompensationPort {
   bool hasFusedSpeedLimit = false;
-  int fusedSpeedLimitMph = 0;
-  int targetSpeedMph = 0;
-  int offsetMph = 0;
+  int fusedSpeedLimitKph = 0;
+  int targetSpeedKph = 0;
+  int offsetKph = 0;
+  uint8_t speedOffsetRaw = 0;
 };
 
 struct SpeedLimitMonitor {
@@ -125,10 +128,13 @@ inline void setBit(can_frame& frame, int bit, bool value) {
   else frame.data[byteIndex] &= static_cast<uint8_t>(~mask);
 }
 
-inline int clampOffsetMph(int value) { return std::max(std::min(value, MAX_SPEED_OFFSET_MPH), 0); }
+inline int clampOffsetKph(int value) { return std::max(std::min(value, MAX_SPEED_OFFSET_KPH), 0); }
 
-inline uint8_t encodeSpeedOffsetRaw(int offsetMph) {
-  return static_cast<uint8_t>(std::max(std::min(offsetMph * SPEED_OFFSET_RAW_PER_MPH, 255), 0));
+inline uint8_t encodeSpeedOffsetRawPct4(int offsetKph, int fusedSpeedLimitKph) {
+  if (fusedSpeedLimitKph <= 0) return 0;
+  int pct = (offsetKph * 100 + fusedSpeedLimitKph / 2) / fusedSpeedLimitKph;
+  pct = std::max(std::min(pct, MAX_SPEED_OFFSET_PCT), 0);
+  return static_cast<uint8_t>(pct * OFFSET_PCT4_RAW_PER_PCT);
 }
 
 inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
@@ -139,34 +145,73 @@ inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
   return fusedSpeedLimitValue;
 }
 
+inline uint8_t readSpeedOffsetRaw(const can_frame& frame) {
+  return static_cast<uint8_t>(((frame.data[1] & 0x3F) << 2) | ((frame.data[0] >> 6) & 0x03));
+}
+
+inline void writeSpeedOffsetRaw(can_frame& frame, uint8_t raw) {
+  frame.data[0] = static_cast<uint8_t>((frame.data[0] & ~0xC0) | ((raw & 0x03) << 6));
+  frame.data[1] = static_cast<uint8_t>((frame.data[1] & ~0x3F) | (raw >> 2));
+}
+
+struct OffsetSlewLimiter {
+  uint8_t lastRaw = 0;
+  uint32_t lastSentMs = 0;
+
+  uint8_t apply(uint8_t targetRaw) {
+    uint8_t shapedRaw = targetRaw;
+    const uint32_t now = millis();
+
+    if (targetRaw < lastRaw && lastSentMs != 0) {
+      const uint32_t rateRawPerSec =
+        static_cast<uint32_t>(OFFSET_SLEW_RATE_PCT_PER_SEC) * OFFSET_PCT4_RAW_PER_PCT;
+      const uint32_t elapsedMs = now - lastSentMs;
+      const uint32_t maxDrop = (rateRawPerSec * elapsedMs + 500U) / 1000U;
+      const uint8_t floorRaw = lastRaw > maxDrop ? static_cast<uint8_t>(lastRaw - maxDrop) : 0;
+      if (targetRaw < floorRaw) shapedRaw = floorRaw;
+    }
+
+    lastRaw = shapedRaw;
+    lastSentMs = now;
+    return shapedRaw;
+  }
+};
+
 // ---- HW3 car handler ----
 
 struct HW3Handler {
   int speedProfile = 1;
   bool FSDEnabled = true;
-  int fallbackSpeedOffsetMph = 0;
+  int fallbackSpeedOffsetKph = 0;
   UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
+  OffsetSlewLimiter offsetSlewLimiter{};
 
-  void setFallbackSpeedOffsetMph(int offsetMph) {
-    fallbackSpeedOffsetMph = offsetMph;
+  void setFallbackSpeedOffsetKph(int offsetKph) {
+    fallbackSpeedOffsetKph = offsetKph;
   }
 
   void refreshUnifiedSpeedCompensation() {
     unifiedSpeedCompensation.hasFusedSpeedLimit = false;
+    unifiedSpeedCompensation.fusedSpeedLimitKph = 0;
+    unifiedSpeedCompensation.targetSpeedKph = 0;
+    unifiedSpeedCompensation.speedOffsetRaw = 0;
     if (enableAutoOffsetFromFusedSpeedLimit) {
       int fusedSpeedLimitValue = 0;
       if (speedLimitMonitor.getFusedSpeedLimitValue(fusedSpeedLimitValue)) {
         unifiedSpeedCompensation.hasFusedSpeedLimit = true;
-        unifiedSpeedCompensation.fusedSpeedLimitMph = fusedSpeedLimitValue;
-        unifiedSpeedCompensation.targetSpeedMph = getTargetSpeedForLimit(fusedSpeedLimitValue);
-        int desiredOffsetMph = unifiedSpeedCompensation.targetSpeedMph > fusedSpeedLimitValue
-          ? (unifiedSpeedCompensation.targetSpeedMph - fusedSpeedLimitValue)
+        unifiedSpeedCompensation.fusedSpeedLimitKph = fusedSpeedLimitValue;
+        unifiedSpeedCompensation.targetSpeedKph = getTargetSpeedForLimit(fusedSpeedLimitValue);
+        int desiredOffsetKph = unifiedSpeedCompensation.targetSpeedKph > fusedSpeedLimitValue
+          ? (unifiedSpeedCompensation.targetSpeedKph - fusedSpeedLimitValue)
           : 0;
-        unifiedSpeedCompensation.offsetMph = clampOffsetMph(desiredOffsetMph);
+        unifiedSpeedCompensation.offsetKph = clampOffsetKph(desiredOffsetKph);
+        unifiedSpeedCompensation.speedOffsetRaw = encodeSpeedOffsetRawPct4(
+          unifiedSpeedCompensation.offsetKph,
+          unifiedSpeedCompensation.fusedSpeedLimitKph);
         return;
       }
     }
-    unifiedSpeedCompensation.offsetMph = clampOffsetMph(fallbackSpeedOffsetMph);
+    unifiedSpeedCompensation.offsetKph = clampOffsetKph(fallbackSpeedOffsetKph);
   }
 
   void handelMessage(can_frame& frame) {
@@ -182,8 +227,9 @@ struct HW3Handler {
     if (frame.can_id == 1021) {
       auto index = readMuxID(frame);
       if (index == 0 && FSDEnabled) {
-        auto off = (uint8_t)((frame.data[3] >> 1) & 0x3F) - 30;
-        setFallbackSpeedOffsetMph(off);
+        int offsetRaw = (frame.data[3] >> 1) & 0x3F;
+        int offsetKph = std::max(0, std::min((offsetRaw - 30) * 5, 100));
+        setFallbackSpeedOffsetKph(offsetKph);
         refreshUnifiedSpeedCompensation();
         setBit(frame, 46, true);
         setSpeedProfileV12V13(frame, speedProfile);
@@ -196,11 +242,11 @@ struct HW3Handler {
       if (index == 2 && FSDEnabled) {
         uint8_t speedOffsetRaw = enableFixedOffsetRawTest
           ? FIXED_OFFSET_TEST_RAW
-          : encodeSpeedOffsetRaw(unifiedSpeedCompensation.offsetMph);
-        frame.data[0] &= ~(0b11000000);
-        frame.data[1] &= ~(0b00111111);
-        frame.data[0] |= (speedOffsetRaw & 0x03) << 6;
-        frame.data[1] |= (speedOffsetRaw >> 2);
+          : (unifiedSpeedCompensation.hasFusedSpeedLimit
+            ? unifiedSpeedCompensation.speedOffsetRaw
+            : readSpeedOffsetRaw(frame));
+        speedOffsetRaw = offsetSlewLimiter.apply(speedOffsetRaw);
+        writeSpeedOffsetRaw(frame, speedOffsetRaw);
         twai_send(frame);
       }
     }
