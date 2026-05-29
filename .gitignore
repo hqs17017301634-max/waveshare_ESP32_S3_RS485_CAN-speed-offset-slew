@@ -1,5 +1,6 @@
 # Arduino/RP2040 build artifacts
 build/
+.pio/
 *.elf
 *.bin
 *.uf2
