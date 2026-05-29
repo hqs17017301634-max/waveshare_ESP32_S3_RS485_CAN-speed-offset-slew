@@ -1,4 +1,4 @@
-# Arduino/RP2040 build artifacts
+# Arduino/RP2040/ESP32 build artifacts
 build/
 *.elf
 *.bin
