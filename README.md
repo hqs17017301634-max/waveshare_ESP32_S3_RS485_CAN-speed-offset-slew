@@ -12,43 +12,86 @@
 
 ### Overview
 
-`ESP32-HW3` is the ESP32-S3 TWAI port of the minimal HW3 activation sketch. It keeps the small HW3-only behavior of `RP2040CAN-HW3`, but replaces MCP2515/SPI with the ESP32-S3 built-in TWAI CAN controller and adds basic CAN stability handling.
+`ESP32-HW3` is the ESP32-S3 TWAI port of the minimal HW3 activation firmware. It keeps the narrow behavior of `RP2040CAN-HW3`, but replaces the external MCP2515/SPI path with the ESP32-S3 built-in TWAI CAN controller.
+
+This is the simplest ESP32 branch: HW3 activation/profile control only, no speed-limit offset feature.
 
 ### Target Hardware
 
 - Board: Waveshare ESP32-S3-RS485-CAN
 - Framework: Arduino via PlatformIO
 - CAN controller: ESP32-S3 built-in TWAI
-- CAN speed: 500 kbps
-- Default pins:
-  - TWAI TX: GPIO15
-  - TWAI RX: GPIO16
-- Queue sizes:
-  - RX queue: 64
-  - TX queue: 16
+- CAN bitrate: 500 kbps
+- Default TWAI TX: GPIO15
+- Default TWAI RX: GPIO16
+- RX queue length: 64
+- TX queue length: 16
 
-### Main Features
+### CAN Functions
 
-- HW3 only.
-- No WiFi, Bluetooth, OTA, Web UI, or dashboard logic.
-- Reads follow distance from CAN ID `1016` and maps it to `speedProfile`.
-- Handles AP/FSD control frame CAN ID `1021`.
-- For `1021 mux 0`:
-  - Enables the FSD/speed-profile control bit.
-  - Writes `speedProfile` into the control frame.
-  - Re-transmits the modified frame.
-- For `1021 mux 1`:
-  - Clears the control/nag bit.
-  - Re-transmits the modified frame.
-- Does not handle `1021 mux 2` speed offset.
+| CAN ID | Function | Behavior |
+|--------|----------|----------|
+| `1016` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
+| `1021 mux 0` | FSD/profile control | Sets `data[5] bit 6`, writes `speedProfile` into `data[6] bit 1..2`, then transmits. |
+| `1021 mux 1` | Control/nag bit | Clears `data[2] bit 3`, then transmits. |
+| `1021 mux 2` | Speed offset | Not processed. |
+
+### Follow-Distance / Speed-Profile Mapping
+
+| Follow distance raw value from `1016` | Written `speedProfile` | Firmware effect |
+|---------------------------------------|------------------------|-----------------|
+| `1` | `2` | More aggressive profile |
+| `2` | `1` | Middle/default profile |
+| `3` | `0` | Softer profile |
+| Other values | unchanged | Keeps last profile |
+
+### FSD Activation Details
+
+On `1021 mux 0`:
+
+- `data[5] bit 6` is set.
+- `data[6] bit 1..2` is replaced with the current `speedProfile`.
+- The modified frame is sent through TWAI.
+
+On `1021 mux 1`:
+
+- `data[2] bit 3` is cleared.
+- The modified frame is sent through TWAI.
+
+### Speed Control
+
+This branch intentionally has no numeric speed-offset feature.
+
+- No `0x399` fused-speed-limit reading.
+- No target speed table.
+- No PCT4 or KPH5 encoding.
+- No slew limiter.
+- No `1021 mux 2` speed-offset injection.
+- The only speed-related behavior is the HW3 `speedProfile` field selected by follow distance.
 
 ### CAN Stability Features
 
-- TWAI hardware acceptance filtering for the required IDs.
-- TWAI alert handling.
-- Bus-off recovery.
-- RX queue / FIFO overrun handling.
-- DLC and standard-frame checks.
+- Uses ESP32-S3 built-in TWAI at 500 kbps.
+- Hardware acceptance filter covers the required IDs `1016` and `1021`.
+- Rejects extended frames, remote frames, and frames shorter than 7 bytes before parsing.
+- TWAI alerts enabled:
+  - bus-off
+  - bus recovered
+  - RX queue full
+  - RX FIFO overrun
+  - TX failed
+- Bus-off recovery is initiated automatically.
+- TWAI is restarted after bus recovery.
+- RX queue is cleared on queue/FIFO overrun.
+- TX wait timeout: `1 ms`.
+- RX wait timeout: `10 ms`.
+
+### What Is Not Included
+
+- No WiFi, Bluetooth, OTA, Web UI, or dashboard runtime.
+- No speed-offset control.
+- No short TX retry loop in this branch.
+- No fused-limit monitor.
 
 ### Build & Flash
 
@@ -59,7 +102,7 @@ pio run -e waveshare_ESP32_S3_RS485_CAN -t upload
 
 ### When To Use
 
-Use this branch when you want ESP32-S3 hardware with the simplest HW3 activation behavior and no speed-offset feature.
+Use this branch when you want ESP32-S3 hardware, built-in TWAI CAN, and the simplest HW3 activation behavior without speed offset.
 
 ---
 
@@ -67,7 +110,9 @@ Use this branch when you want ESP32-S3 hardware with the simplest HW3 activation
 
 ### 概述
 
-`ESP32-HW3` 是最小 HW3 激活草图的 ESP32-S3 TWAI 移植版。它保留了 `RP2040CAN-HW3` 的极简 HW3 行为，但把 MCP2515/SPI 换成 ESP32-S3 内置 TWAI CAN 控制器，并加入基础 CAN 稳定性处理。
+`ESP32-HW3` 是最小 HW3 激活固件的 ESP32-S3 TWAI 移植版。它保留 `RP2040CAN-HW3` 的窄行为范围，但把外置 MCP2515/SPI 换成 ESP32-S3 内置 TWAI CAN 控制器。
+
+这是最简单的 ESP32 分支：只做 HW3 激活/速度档控制，不做限速偏移。
 
 ### 目标硬件
 
@@ -75,35 +120,76 @@ Use this branch when you want ESP32-S3 hardware with the simplest HW3 activation
 - 框架：PlatformIO 下的 Arduino
 - CAN 控制器：ESP32-S3 内置 TWAI
 - CAN 速率：500 kbps
-- 默认引脚：
-  - TWAI TX：GPIO15
-  - TWAI RX：GPIO16
-- 队列大小：
-  - RX 队列：64
-  - TX 队列：16
+- 默认 TWAI TX：GPIO15
+- 默认 TWAI RX：GPIO16
+- RX 队列长度：64
+- TX 队列长度：16
 
-### 主要功能
+### CAN 功能
 
-- 仅支持 HW3。
-- 没有 WiFi、蓝牙、OTA、Web UI 或 Dashboard 逻辑。
-- 从 CAN ID `1016` 读取跟车距离，并映射为 `speedProfile`。
-- 处理 AP/FSD 控制帧 CAN ID `1021`。
-- 对 `1021 mux 0`：
-  - 启用 FSD/速度档控制位。
-  - 把 `speedProfile` 写入控制帧。
-  - 重新发送修改后的帧。
-- 对 `1021 mux 1`：
-  - 清除控制/提示相关位。
-  - 重新发送修改后的帧。
-- 不处理 `1021 mux 2` 速度偏移。
+| CAN ID | 功能 | 行为 |
+|--------|------|------|
+| `1016` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
+| `1021 mux 0` | FSD/速度档控制 | 设置 `data[5] bit 6`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后发送。 |
+| `1021 mux 1` | 控制/提示位 | 清除 `data[2] bit 3`，然后发送。 |
+| `1021 mux 2` | 速度偏移 | 不处理。 |
+
+### 跟车距离 / 速度档映射
+
+| `1016` 跟车距离 raw 值 | 写入的 `speedProfile` | 固件效果 |
+|------------------------|------------------------|----------|
+| `1` | `2` | 更激进速度档 |
+| `2` | `1` | 中间/默认速度档 |
+| `3` | `0` | 更柔和速度档 |
+| 其他值 | 不变 | 保持上一档 |
+
+### FSD 激活细节
+
+在 `1021 mux 0` 上：
+
+- 设置 `data[5] bit 6`。
+- 用当前 `speedProfile` 替换 `data[6] bit 1..2`。
+- 通过 TWAI 发送修改后的帧。
+
+在 `1021 mux 1` 上：
+
+- 清除 `data[2] bit 3`。
+- 通过 TWAI 发送修改后的帧。
+
+### 速度控制
+
+这个分支故意不包含具体数字速度偏移功能。
+
+- 不读取 `0x399` 融合限速。
+- 没有目标速度表。
+- 没有 PCT4 或 KPH5 编码。
+- 没有 slew 限幅。
+- 不向 `1021 mux 2` 注入速度偏移。
+- 唯一与速度相关的行为是跟车距离选择的 HW3 `speedProfile` 字段。
 
 ### CAN 稳定性功能
 
-- 对必要 ID 做 TWAI 硬件验收过滤。
-- TWAI alert 处理。
-- Bus-off 自动恢复。
-- RX 队列 / FIFO 溢出处理。
-- DLC 和标准帧检查。
+- 使用 ESP32-S3 内置 TWAI，500 kbps。
+- 硬件验收过滤覆盖需要的 ID：`1016` 和 `1021`。
+- 解析前拒绝扩展帧、远程帧和短于 7 字节的帧。
+- 启用的 TWAI alerts：
+  - bus-off
+  - bus recovered
+  - RX queue full
+  - RX FIFO overrun
+  - TX failed
+- bus-off 后自动发起恢复。
+- bus 恢复后自动重新启动 TWAI。
+- RX 队列/FIFO 溢出时清空接收队列。
+- TX 等待超时：`1 ms`。
+- RX 等待超时：`10 ms`。
+
+### 不包含的内容
+
+- 没有 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
+- 没有速度偏移控制。
+- 本分支没有短 TX 重试循环。
+- 没有融合限速监控。
 
 ### 编译与烧录
 
@@ -114,4 +200,4 @@ pio run -e waveshare_ESP32_S3_RS485_CAN -t upload
 
 ### 适用场景
 
-如果你想使用 ESP32-S3 硬件，但只需要最简单的 HW3 激活功能，不需要速度偏移，使用这个分支。
+如果你想使用 ESP32-S3 硬件、内置 TWAI CAN，并且只需要最简单的 HW3 激活功能，不需要速度偏移，使用这个分支。
