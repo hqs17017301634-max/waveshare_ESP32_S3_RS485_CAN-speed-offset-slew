@@ -12,75 +12,133 @@
 
 ### Overview
 
-`ESP32-FSD` is the enhanced ESP32-S3 TWAI branch for Waveshare ESP32-S3-RS485-CAN. It keeps a CAN-only HW3 firmware and adds speed-limit-based speed offset control, PCT4 encoding, slew limiting, and stronger TWAI reliability handling.
+`ESP32-FSD` is the enhanced ESP32-S3 TWAI branch for Waveshare ESP32-S3-RS485-CAN. It is CAN-only and HW3-only, but includes the full practical feature set currently considered useful: FSD activation, follow-distance speed profile control, fused-speed-limit based speed offset, PCT4 encoding, downward slew limiting, and TWAI reliability handling.
+
+No WiFi, Bluetooth, OTA, Web UI, or dashboard runtime is initialized.
 
 ### Target Hardware
 
 - Board: Waveshare ESP32-S3-RS485-CAN
 - Framework: Arduino via PlatformIO
 - CAN controller: ESP32-S3 built-in TWAI
-- CAN speed: 500 kbps
+- CAN bitrate: 500 kbps
 - Flash target: 16 MB
 - Partition table: `huge_app.csv`
-- Default pins:
-  - TWAI TX: GPIO15
-  - TWAI RX: GPIO16
-  - LED: GPIO14
-- Queue sizes:
-  - RX queue: 64
-  - TX queue: 16
+- Default TWAI TX: GPIO15
+- Default TWAI RX: GPIO16
+- LED: GPIO14
+- RX queue length: 64
+- TX queue length: 16
 
-### Main Features
+### CAN Functions
 
-- HW3 only.
-- CAN-only firmware: no WiFi, Bluetooth, OTA, Web UI, or dashboard runtime.
-- Reads follow distance from CAN ID `1016` and maps it to `speedProfile`.
-- Handles AP/FSD control frame CAN ID `1021`.
-- Reads fused speed limit from CAN ID `0x399`.
-- Injects speed offset into `1021 mux 2`.
-- Uses PCT4 speed-offset encoding: `raw = percent * 4`.
-- Downward slew limiting: default `15%/s`.
-- Uses original/stock speed-offset raw value when no valid fused speed limit is available.
+| CAN ID | Function | Behavior |
+|--------|----------|----------|
+| `1016` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
+| `1021 mux 0` | FSD/profile control | Sets bit `46`, writes `speedProfile` into `data[6] bit 1..2`, then transmits. |
+| `1021 mux 1` | Control/nag bit | Clears bit `19`, then transmits. |
+| `1021 mux 2` | Speed offset | Writes PCT4 speed-offset raw value after slew limiting. |
+| `0x399` | Fused speed limit | Reads `data[1] & 0x1F`; `0` and `31` are invalid; valid raw value is multiplied by `5 kph`. |
 
-### FSD / CAN Behavior
+### Follow-Distance / Speed-Profile Mapping
 
-- `1016`: follow distance -> `speedProfile`.
-- `1021 mux 0`: sets the activation bit and writes `speedProfile`.
-- `1021 mux 1`: clears the related control/nag bit.
-- `1021 mux 2`: writes the PCT4 speed offset after slew limiting.
-- `0x399`: reads fused speed limit from `data[1] & 0x1F`, valid values are multiplied by 5 kph.
+| Follow distance raw value from `1016` | Written `speedProfile` | Firmware effect |
+|---------------------------------------|------------------------|-----------------|
+| `1` | `2` | More aggressive profile |
+| `2` | `1` | Middle/default profile |
+| `3` | `0` | Softer profile |
+| Other values | unchanged | Keeps last profile |
 
-### Speed Offset Logic
+### FSD Activation Details
 
-Default target-speed buckets:
+On `1021 mux 0`:
 
-| Fused limit | Target speed |
-|-------------|--------------|
-| `< 60 kph` | `60 kph` |
-| `60..79 kph` | `80 kph` |
-| `80..99 kph` | `100 kph` |
-| `100..119 kph` | `120 kph` |
-| `>= 120 kph` | no boost |
+- Sets bit `46` to enable the HW3 FSD/profile control path.
+- Writes current `speedProfile` into `data[6] bit 1..2`.
+- Sends the modified frame through TWAI.
 
-Offset rules:
+On `1021 mux 1`:
 
-- Offset = `targetSpeedKph - fusedSpeedLimitKph`.
-- Absolute offset pre-clamp: `25 kph`.
-- PCT4 cap: `50%`.
-- Raw encoding: `raw = percent * 4`.
-- Downward raw changes are limited to `15%/s`, rising changes pass through immediately.
+- Clears bit `19`.
+- Sends the modified frame through TWAI.
+
+On `1021 mux 2`:
+
+- Uses the computed PCT4 speed offset if a valid fused speed limit is available.
+- If no valid fused speed limit is available, preserves the original stock speed-offset raw value from the frame.
+- Applies downward slew limiting before writing the raw value.
+
+### Speed Limit Reading
+
+`0x399` fused speed limit parsing:
+
+- Source field: `data[1] & 0x1F`.
+- Invalid raw values: `0` and `31`.
+- Effective limit: `raw * 5 kph`.
+- Valid effective range from this parser: `5..150 kph`.
+
+### Target-Speed Table
+
+| Fused speed limit | Target speed | Maximum desired boost before clamp |
+|-------------------|--------------|------------------------------------|
+| `< 60 kph` | `60 kph` | `60 - limit` |
+| `60..79 kph` | `80 kph` | `80 - limit` |
+| `80..99 kph` | `100 kph` | `100 - limit` |
+| `100..119 kph` | `120 kph` | `120 - limit` |
+| `>= 120 kph` | same as limit | `0 kph` |
+
+### Speed Offset Rules
+
+- Desired offset: `targetSpeedKph - fusedSpeedLimitKph`.
+- Absolute offset pre-clamp: `0..25 kph`.
+- PCT4 percentage cap: `50%`.
+- PCT4 raw formula: `raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`.
+- Final raw range used by the algorithm: `0..200`.
+- Raw is written into `1021 mux 2` using `data[0] bit 6..7` and `data[1] bit 0..5`.
+
+Examples with the default table:
+
+| Fused limit | Target | Offset after clamp | Percent | PCT4 raw |
+|-------------|--------|--------------------|---------|----------|
+| `30 kph` | `60 kph` | `25 kph` | capped to `50%` | `200` |
+| `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
+| `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
+| `75 kph` | `80 kph` | `5 kph` | `7%` | `28` |
+| `80 kph` | `100 kph` | `20 kph` | `25%` | `100` |
+| `95 kph` | `100 kph` | `5 kph` | `5%` | `20` |
+| `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
+| `115 kph` | `120 kph` | `5 kph` | `4%` | `16` |
+| `120 kph+` | same as limit | `0 kph` | `0%` | `0` |
+
+### Slew Limiter
+
+The slew limiter only limits downward raw changes, because sudden loss of offset can feel like sudden deceleration.
+
+- Default downward limit: `15%/s`.
+- PCT4 raw rate: `15 * 4 = 60 raw units/s`.
+- Rising offset changes pass immediately.
+- If fused speed limit suddenly drops and target raw goes lower, the firmware ramps downward instead of jumping directly.
 
 ### CAN Reliability Features
 
-- TWAI alert handling.
-- Bus-off detection and automatic recovery.
-- Re-starts TWAI after bus recovery.
-- TX failure short retry: one retry after a 1 ms delay.
-- TX wait timeout: 5 ms.
-- RX wait timeout: 1 ms.
-- DLC guards for all parsed frames.
+- TWAI alerts enabled:
+  - bus-off
+  - bus recovered
+  - recovery in progress
+  - error passive
+  - bus error
+  - TX failed
+  - RX queue full
+  - RX FIFO overrun
+- Bus-off is detected and automatic recovery is initiated.
+- TWAI is restarted after recovery.
+- TX failure short retry: `1` retry after `1 ms`.
+- TX wait timeout: `5 ms`.
+- RX wait timeout: `1 ms`.
+- RX scan limit: `8` frames per loop pass.
+- DLC protection for all parsed frames.
 - Rejects extended frames, remote frames, and over-length frames.
-- Hardware acceptance filter: coarse filter for IDs near `0x399 / 1016 / 1021`.
+- Hardware acceptance filter: coarse 16-ID pass set around `0x399`, `1016`, and `1021`.
 - Software exact filter: only `0x399`, `1016`, and `1021` are processed.
 
 ### Build & Flash
@@ -97,13 +155,19 @@ pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_f
 pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
 ```
 
-### Full BIN
+### Full 16 MB BIN
 
-This branch can produce a full merged image for flashing from offset `0x0`. The generated release files are usually stored under `release/ESP32-FSD/` when created locally.
+This branch can generate a full merged 16 MB image for flashing from offset `0x0`. A typical local output path is:
+
+```text
+release/ESP32-FSD/ESP32-FSD-waveshare-full-16MB.bin
+```
+
+The 16 MB full image is convenient for complete factory-style flashing. Normal PlatformIO upload is still fine for development.
 
 ### When To Use
 
-Use this branch when you want the most capable ESP32-S3 version: HW3 FSD activation, speed-limit-aware offset control, PCT4 compatibility, slew limiting, and TWAI stability protections.
+Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FSD activation, speed-limit-aware speed offset, DEV-compatible PCT4 default encoding, downward slew protection, and TWAI stability handling.
 
 ---
 
@@ -111,7 +175,9 @@ Use this branch when you want the most capable ESP32-S3 version: HW3 FSD activat
 
 ### 概述
 
-`ESP32-FSD` 是面向 Waveshare ESP32-S3-RS485-CAN 的增强版 ESP32-S3 TWAI 分支。它保留纯 CAN 的 HW3 固件，并加入基于限速的速度偏移、PCT4 编码、slew 限幅，以及更强的 TWAI 稳定性处理。
+`ESP32-FSD` 是面向 Waveshare ESP32-S3-RS485-CAN 的增强版 ESP32-S3 TWAI 分支。它是纯 CAN、仅 HW3 的固件，但包含目前最有实际价值的一套功能：FSD 激活、跟车距离速度档控制、基于融合限速的速度偏移、PCT4 编码、下降 slew 限幅，以及 TWAI 稳定性处理。
+
+不会初始化 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
 
 ### 目标硬件
 
@@ -121,65 +187,121 @@ Use this branch when you want the most capable ESP32-S3 version: HW3 FSD activat
 - CAN 速率：500 kbps
 - Flash 目标：16 MB
 - 分区表：`huge_app.csv`
-- 默认引脚：
-  - TWAI TX：GPIO15
-  - TWAI RX：GPIO16
-  - LED：GPIO14
-- 队列大小：
-  - RX 队列：64
-  - TX 队列：16
+- 默认 TWAI TX：GPIO15
+- 默认 TWAI RX：GPIO16
+- LED：GPIO14
+- RX 队列长度：64
+- TX 队列长度：16
 
-### 主要功能
+### CAN 功能
 
-- 仅支持 HW3。
-- 纯 CAN 固件：没有 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
-- 从 CAN ID `1016` 读取跟车距离，并映射为 `speedProfile`。
-- 处理 AP/FSD 控制帧 CAN ID `1021`。
-- 从 CAN ID `0x399` 读取融合限速。
-- 向 `1021 mux 2` 注入速度偏移。
-- 使用 PCT4 速度偏移编码：`raw = 百分比 * 4`。
-- 下降 slew 限幅：默认 `15%/秒`。
-- 无有效融合限速时，使用原车/stock 速度偏移 raw 值。
+| CAN ID | 功能 | 行为 |
+|--------|------|------|
+| `1016` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
+| `1021 mux 0` | FSD/速度档控制 | 设置 bit `46`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后发送。 |
+| `1021 mux 1` | 控制/提示位 | 清除 bit `19`，然后发送。 |
+| `1021 mux 2` | 速度偏移 | 写入经过 slew 限幅后的 PCT4 速度偏移 raw 值。 |
+| `0x399` | 融合限速 | 读取 `data[1] & 0x1F`；`0` 和 `31` 无效；有效 raw 乘以 `5 kph`。 |
 
-### FSD / CAN 行为
+### 跟车距离 / 速度档映射
 
-- `1016`：跟车距离 -> `speedProfile`。
-- `1021 mux 0`：设置激活位，并写入 `speedProfile`。
-- `1021 mux 1`：清除相关控制/提示位。
-- `1021 mux 2`：写入经过 slew 限幅后的 PCT4 速度偏移。
-- `0x399`：从 `data[1] & 0x1F` 读取融合限速，有效值乘以 5 kph。
+| `1016` 跟车距离 raw 值 | 写入的 `speedProfile` | 固件效果 |
+|------------------------|------------------------|----------|
+| `1` | `2` | 更激进速度档 |
+| `2` | `1` | 中间/默认速度档 |
+| `3` | `0` | 更柔和速度档 |
+| 其他值 | 不变 | 保持上一档 |
 
-### 速度偏移逻辑
+### FSD 激活细节
 
-默认目标速度档：
+在 `1021 mux 0` 上：
 
-| 融合限速 | 目标速度 |
-|----------|----------|
-| `< 60 kph` | `60 kph` |
-| `60..79 kph` | `80 kph` |
-| `80..99 kph` | `100 kph` |
-| `100..119 kph` | `120 kph` |
-| `>= 120 kph` | 不加速 |
+- 设置 bit `46`，启用 HW3 FSD/速度档控制路径。
+- 把当前 `speedProfile` 写入 `data[6] bit 1..2`。
+- 通过 TWAI 发送修改后的帧。
 
-偏移规则：
+在 `1021 mux 1` 上：
 
-- 偏移 = `targetSpeedKph - fusedSpeedLimitKph`。
-- 绝对偏移预夹紧：`25 kph`。
+- 清除 bit `19`。
+- 通过 TWAI 发送修改后的帧。
+
+在 `1021 mux 2` 上：
+
+- 如果存在有效融合限速，使用计算出的 PCT4 速度偏移。
+- 如果没有有效融合限速，保留帧内原车 stock 速度偏移 raw 值。
+- 写入前应用下降 slew 限幅。
+
+### 限速读取
+
+`0x399` 融合限速解析：
+
+- 来源字段：`data[1] & 0x1F`。
+- 无效 raw 值：`0` 和 `31`。
+- 有效限速：`raw * 5 kph`。
+- 此解析器有效范围：`5..150 kph`。
+
+### 目标速度表
+
+| 融合限速 | 目标速度 | 夹紧前最大期望提升 |
+|----------|----------|--------------------|
+| `< 60 kph` | `60 kph` | `60 - 限速` |
+| `60..79 kph` | `80 kph` | `80 - 限速` |
+| `80..99 kph` | `100 kph` | `100 - 限速` |
+| `100..119 kph` | `120 kph` | `120 - 限速` |
+| `>= 120 kph` | 等于限速 | `0 kph` |
+
+### 速度偏移规则
+
+- 期望偏移：`targetSpeedKph - fusedSpeedLimitKph`。
+- 绝对偏移预夹紧：`0..25 kph`。
 - PCT4 百分比上限：`50%`。
-- raw 编码：`raw = 百分比 * 4`。
-- raw 下降按 `15%/秒` 限幅，上升立即放行。
+- PCT4 raw 公式：`raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`。
+- 算法最终使用 raw 范围：`0..200`。
+- raw 写入 `1021 mux 2` 的 `data[0] bit 6..7` 和 `data[1] bit 0..5`。
+
+默认表下的例子：
+
+| 融合限速 | 目标 | 夹紧后偏移 | 百分比 | PCT4 raw |
+|----------|------|------------|--------|----------|
+| `30 kph` | `60 kph` | `25 kph` | 夹到 `50%` | `200` |
+| `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
+| `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
+| `75 kph` | `80 kph` | `5 kph` | `7%` | `28` |
+| `80 kph` | `100 kph` | `20 kph` | `25%` | `100` |
+| `95 kph` | `100 kph` | `5 kph` | `5%` | `20` |
+| `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
+| `115 kph` | `120 kph` | `5 kph` | `4%` | `16` |
+| `120 kph+` | 等于限速 | `0 kph` | `0%` | `0` |
+
+### Slew 限幅
+
+Slew 限幅只限制 raw 下降，因为偏移突然消失可能带来突然减速体感。
+
+- 默认下降限幅：`15%/秒`。
+- PCT4 raw 下降速率：`15 * 4 = 60 raw/秒`。
+- 偏移上升立即放行。
+- 当融合限速突然变化导致目标 raw 降低时，固件会平滑下降，而不是直接跳到低值。
 
 ### CAN 稳定性功能
 
-- TWAI alert 处理。
-- Bus-off 检测和自动恢复。
-- Bus 恢复后自动重新启动 TWAI。
-- TX 失败短重试：延迟 1 ms 后重试 1 次。
-- TX 等待超时：5 ms。
-- RX 等待超时：1 ms。
+- 启用的 TWAI alerts：
+  - bus-off
+  - bus recovered
+  - recovery in progress
+  - error passive
+  - bus error
+  - TX failed
+  - RX queue full
+  - RX FIFO overrun
+- 检测 bus-off 并自动发起恢复。
+- 恢复后自动重新启动 TWAI。
+- TX 失败短重试：`1` 次，间隔 `1 ms`。
+- TX 等待超时：`5 ms`。
+- RX 等待超时：`1 ms`。
+- RX 每轮最多扫描：`8` 帧。
 - 所有解析帧都有 DLC 保护。
 - 拒绝扩展帧、远程帧和超长帧。
-- 硬件验收过滤：对 `0x399 / 1016 / 1021` 附近 ID 做粗过滤。
+- 硬件验收过滤：围绕 `0x399`、`1016`、`1021` 的 16 个 ID 粗过滤集合。
 - 软件精确过滤：只处理 `0x399`、`1016`、`1021`。
 
 ### 编译与烧录
@@ -196,10 +318,16 @@ pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_f
 pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
 ```
 
-### 全量 BIN
+### 16 MB 全量 BIN
 
-本分支可生成从 `0x0` 写入的合并全量镜像。本地生成后通常放在 `release/ESP32-FSD/` 目录。
+本分支可以生成从 `0x0` 写入的 16 MB 合并全量镜像。常见本地输出路径：
+
+```text
+release/ESP32-FSD/ESP32-FSD-waveshare-full-16MB.bin
+```
+
+16 MB 全量包适合完整工厂式烧录；日常开发仍可用普通 PlatformIO upload。
 
 ### 适用场景
 
-如果你需要功能最完整的 ESP32-S3 版本：HW3 FSD 激活、限速感知速度偏移、PCT4 兼容、slew 限幅和 TWAI 稳定性保护，使用这个分支。
+如果你需要当前功能最完整的 ESP32-S3 固件：HW3 FSD 激活、限速感知速度偏移、DEV 兼容的 PCT4 默认编码、下降 slew 保护，以及 TWAI 稳定性处理，使用这个分支。
