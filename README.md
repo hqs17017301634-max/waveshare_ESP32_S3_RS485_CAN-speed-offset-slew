@@ -12,47 +12,79 @@
 
 ### Overview
 
-`RP2040CAN-HW3` is the minimal RP2040 + MCP2515 HW3 branch. It removes HW4, Legacy, speed-limit offset, and extra configuration logic, keeping only the basic HW3 FSD activation path.
+`RP2040CAN-HW3` is the minimal RP2040 + MCP2515 HW3 branch. It removes HW4, Legacy, fused-speed-limit reading, speed-offset injection, and optional runtime features.
+
+The branch focuses on one job: listen for HW3 CAN frames, modify the FSD activation/profile bits, and re-send the modified frames.
 
 ### Target Hardware
 
 - MCU: RP2040 board
 - CAN controller: MCP2515 over SPI1
-- CAN speed: 500 kbps
+- CAN bitrate: 500 kbps
 - MCP2515 oscillator: 16 MHz
 - MCP2515 SPI speed: 10 MHz
-- Default pins in the sketch:
+- Source pins:
   - CS: GPIO9
   - SPI1 RX: GPIO12
   - SPI1 TX: GPIO11
   - SPI1 SCK: GPIO10
+  - LED: `PIN_LED`
 
-### Main Features
+### CAN Functions
 
-- HW3 only.
-- Reads follow distance from CAN ID `1016` and maps it to `speedProfile`.
-- Handles AP/FSD control frame CAN ID `1021`.
-- For `1021 mux 0`:
-  - Sets `data[5] bit 6`.
-  - Writes the selected speed profile into `data[6] bit 1..2`.
-  - Re-transmits the modified frame.
-- For `1021 mux 1`:
-  - Clears `data[2] bit 3`.
-  - Re-transmits the modified frame.
-- Does not process `1021 mux 2` speed offset.
+| CAN ID | Function | Behavior |
+|--------|----------|----------|
+| `1016` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
+| `1021 mux 0` | FSD/profile control | Sets `data[5] bit 6`, writes `speedProfile` into `data[6] bit 1..2`, then re-sends. |
+| `1021 mux 1` | Control/nag bit | Clears `data[2] bit 3`, then re-sends. |
+| `1021 mux 2` | Speed offset | Not processed; this branch intentionally skips speed-offset control. |
 
-### What This Branch Does Not Include
+### Follow-Distance / Speed-Profile Mapping
 
-- No speed-limit reading from `0x399`.
-- No speed offset injection.
-- No PCT4 encoding.
+| Follow distance raw value from `1016` | Written `speedProfile` | Firmware effect |
+|---------------------------------------|------------------------|-----------------|
+| `1` | `2` | More aggressive profile |
+| `2` | `1` | Middle/default profile |
+| `3` | `0` | Softer profile |
+| Other values | unchanged | Keeps last profile |
+
+### FSD Activation Details
+
+On `1021 mux 0`:
+
+- `data[5] |= 0x40` sets bit 6.
+- `data[6] &= ~0x06` clears the profile field.
+- `data[6] |= speedProfile << 1` writes the current profile.
+- The modified frame is sent immediately with `mcp->sendMessage()`.
+
+On `1021 mux 1`:
+
+- `data[2] &= ~(1 << 3)` clears the related control/nag bit.
+- The modified frame is sent immediately.
+
+### Speed Control
+
+This branch does **not** perform numeric speed-limit control.
+
+- No `0x399` fused-speed-limit reading.
+- No target-speed buckets such as `60 / 80 / 100 / 120`.
+- No speed-offset raw encoding.
+- No PCT4 or KPH5 encoding.
 - No slew limiter.
-- No multi-vehicle HW4/Legacy code.
-- No send retry or MCP2515 error recovery logic.
+- No `1021 mux 2` modification.
+- Vehicle speed behavior is only affected through the `speedProfile` bits selected from follow distance.
+
+### CAN Stability
+
+- Uses MCP2515 `readMessage()` / `sendMessage()`.
+- No send retry wrapper.
+- No explicit MCP2515 bus-off recovery logic.
+- No TWAI alert handling because this is an external MCP2515 branch.
+- LED is low when a frame is read and high when no frame is available.
 
 ### When To Use
 
-Use this branch when you want the simplest RP2040-based HW3 activation sketch with the least code and the smallest behavior surface.
+Use this branch when you want the least code and the narrowest behavior surface for RP2040 HW3 activation only.
 
 ---
 
@@ -60,7 +92,9 @@ Use this branch when you want the simplest RP2040-based HW3 activation sketch wi
 
 ### 概述
 
-`RP2040CAN-HW3` 是最小化的 RP2040 + MCP2515 HW3 分支。它删除了 HW4、Legacy、限速偏移和多余配置逻辑，只保留基础 HW3 FSD 激活路径。
+`RP2040CAN-HW3` 是最小化的 RP2040 + MCP2515 HW3 分支。它删除了 HW4、Legacy、融合限速读取、速度偏移注入，以及可选运行逻辑。
+
+这个分支只专注一件事：监听 HW3 CAN 帧，修改 FSD 激活/速度档 bit，然后重发修改后的帧。
 
 ### 目标硬件
 
@@ -69,35 +103,65 @@ Use this branch when you want the simplest RP2040-based HW3 activation sketch wi
 - CAN 速率：500 kbps
 - MCP2515 晶振：16 MHz
 - MCP2515 SPI 速率：10 MHz
-- 草图内默认引脚：
+- 源码引脚：
   - CS：GPIO9
   - SPI1 RX：GPIO12
   - SPI1 TX：GPIO11
   - SPI1 SCK：GPIO10
+  - LED：`PIN_LED`
 
-### 主要功能
+### CAN 功能
 
-- 仅支持 HW3。
-- 从 CAN ID `1016` 读取跟车距离，并映射为 `speedProfile`。
-- 处理 AP/FSD 控制帧 CAN ID `1021`。
-- 对 `1021 mux 0`：
-  - 设置 `data[5] bit 6`。
-  - 把当前速度档写入 `data[6] bit 1..2`。
-  - 重新发送修改后的帧。
-- 对 `1021 mux 1`：
-  - 清除 `data[2] bit 3`。
-  - 重新发送修改后的帧。
-- 不处理 `1021 mux 2` 速度偏移。
+| CAN ID | 功能 | 行为 |
+|--------|------|------|
+| `1016` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
+| `1021 mux 0` | FSD/速度档控制 | 设置 `data[5] bit 6`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后重发。 |
+| `1021 mux 1` | 控制/提示位 | 清除 `data[2] bit 3`，然后重发。 |
+| `1021 mux 2` | 速度偏移 | 不处理；本分支故意不做速度偏移控制。 |
 
-### 本分支不包含
+### 跟车距离 / 速度档映射
 
-- 不读取 `0x399` 限速。
-- 不注入速度偏移。
-- 不使用 PCT4 编码。
+| `1016` 跟车距离 raw 值 | 写入的 `speedProfile` | 固件效果 |
+|------------------------|------------------------|----------|
+| `1` | `2` | 更激进速度档 |
+| `2` | `1` | 中间/默认速度档 |
+| `3` | `0` | 更柔和速度档 |
+| 其他值 | 不变 | 保持上一档 |
+
+### FSD 激活细节
+
+在 `1021 mux 0` 上：
+
+- `data[5] |= 0x40` 设置 bit 6。
+- `data[6] &= ~0x06` 清空速度档字段。
+- `data[6] |= speedProfile << 1` 写入当前速度档。
+- 用 `mcp->sendMessage()` 立即发送修改后的帧。
+
+在 `1021 mux 1` 上：
+
+- `data[2] &= ~(1 << 3)` 清除相关控制/提示 bit。
+- 立即发送修改后的帧。
+
+### 速度控制
+
+这个分支**不做具体数字限速控制**。
+
+- 不读取 `0x399` 融合限速。
+- 没有 `60 / 80 / 100 / 120` 目标速度档。
+- 没有速度偏移 raw 编码。
+- 没有 PCT4 或 KPH5 编码。
 - 没有 slew 限幅。
-- 没有 HW4/Legacy 多车型代码。
-- 没有发送重试或 MCP2515 错误恢复逻辑。
+- 不修改 `1021 mux 2`。
+- 对车速行为的影响只来自跟车距离映射出的 `speedProfile` bit。
+
+### CAN 稳定性
+
+- 使用 MCP2515 的 `readMessage()` / `sendMessage()`。
+- 没有发送重试封装。
+- 没有显式 MCP2515 bus-off 恢复逻辑。
+- 因为是外置 MCP2515 分支，所以没有 TWAI alert。
+- 读到帧时 LED 低电平；未读到帧时 LED 高电平。
 
 ### 适用场景
 
-如果你只需要最简单的 RP2040 HW3 激活草图，追求代码最少、行为最单纯，使用这个分支。
+如果你想要代码最少、行为面最窄的 RP2040 HW3 激活版本，使用这个分支。
