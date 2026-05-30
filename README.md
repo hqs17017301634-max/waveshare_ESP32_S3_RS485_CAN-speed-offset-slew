@@ -12,37 +12,85 @@
 
 ### Overview
 
-`RP2040CAN-FSD` is the original RP2040 + MCP2515 CAN sketch. It keeps the wider FSD code path and supports multiple vehicle handler variants through compile-time selection.
+`RP2040CAN-FSD` is the original RP2040 + MCP2515 full/reference branch. It keeps the older multi-handler structure and can compile HW3, HW4, or Legacy behavior by changing the compile-time macro.
+
+This branch is useful as a reference implementation because it preserves the wider feature set, but it is not the smallest or most stable branch.
 
 ### Target Hardware
 
 - MCU: RP2040 board
 - CAN controller: MCP2515 over SPI
-- CAN speed: 500 kbps
+- CAN bitrate: 500 kbps
+- MCP2515 oscillator: 16 MHz
 - Default CAN CS: board macro `PIN_CAN_CS`
-- Other CAN pins: `PIN_CAN_INTERRUPT`, `PIN_CAN_STANDBY`, `PIN_CAN_RESET`
+- Other board macros used by the sketch: `PIN_CAN_INTERRUPT`, `PIN_CAN_STANDBY`, `PIN_CAN_RESET`, `PIN_LED`
 
-### Main Features
+### Build Target
 
-- Supports HW3, HW4, and Legacy handlers in the source.
-- Default compile target is `HW3`.
-- Reads follow-distance frames and maps them to `speedProfile`.
-- Handles FSD-related control frames.
-- Reads fused speed limit from `0x399`.
-- Computes a target speed bucket and writes a speed offset into the control frame.
-- Uses MCP2515 `sendMessage()` / `readMessage()` for CAN traffic.
+- Default selected target in source: `HW3`
+- Alternative source handlers still present: `HW4`, `LEGACY`
+- Handler selection is compile-time only through `#define HW3`, `#define HW4`, or `#define LEGACY`.
 
-### Current Behavior
+### HW3 CAN Functions
 
-- HW3 follow distance source: CAN ID `1016`.
-- HW3 FSD control source: CAN ID `1021`.
-- Fused speed limit source: CAN ID `0x399`.
-- Speed offset encoding: legacy absolute offset style, `offset * 10`.
-- Max computed offset clamp: `25`.
+| CAN ID | Function | Behavior |
+|--------|----------|----------|
+| `1016` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
+| `1021 mux 0` | FSD/profile control | Sets bit `46`, writes `speedProfile` into `data[6] bit 1..2`, then re-sends. |
+| `1021 mux 1` | Control/nag bit | Clears bit `19`, then re-sends. |
+| `1021 mux 2` | Speed offset | Writes a computed speed-offset raw value. |
+| `0x399` | Fused speed limit | Reads `data[1] & 0x1F`; `0` and `31` are invalid; valid raw value is multiplied by `5`. |
 
-### Notes
+### HW3 Follow-Distance Mapping
 
-This branch is useful as the original RP2040 full-feature reference. It is not the most optimized branch: it still contains multi-handler code, older runtime switches, and no TWAI-specific stability features because it targets MCP2515.
+| Follow distance raw value | Written `speedProfile` | Firmware effect |
+|---------------------------|------------------------|-----------------|
+| `1` | `2` | More aggressive profile |
+| `2` | `1` | Middle/default profile |
+| `3` | `0` | Softer profile |
+| Other values | unchanged | Keeps last profile |
+
+### HW3 Speed Offset Logic
+
+The source variable names call the value `Mph`, but the fused-speed-limit source is `raw * 5`, matching the usual fused-limit step size. Treat the values below as firmware units from `0x399`; this branch labels them as mph in code.
+
+Default target-speed buckets:
+
+| Fused limit value | Target value | Computed absolute offset before clamp |
+|-------------------|--------------|---------------------------------------|
+| `< 60` | `60` | `60 - limit` |
+| `60..79` | `80` | `80 - limit` |
+| `80..99` | `100` | `100 - limit` |
+| `100..119` | `120` | `120 - limit` |
+| `>= 120` | same as limit | `0` |
+
+Offset rules:
+
+- Computed offset is clamped to `0..25`.
+- Wire raw value is `offset * 10`.
+- Raw value is clamped to `0..255`.
+- Example: limit `50` -> target `60` -> offset `10` -> raw `100`.
+- Example: limit `60` -> target `80` -> offset `20` -> raw `200`.
+- Example: limit `90` -> target `100` -> offset `10` -> raw `100`.
+- If there is no valid fused limit, the branch falls back to the stock offset extracted from `1021 mux 0`.
+- Optional fixed raw test exists in source: `FIXED_OFFSET_TEST_RAW = 40`, disabled by default.
+
+### HW4 / Legacy Notes
+
+- `HW4` code path still exists and includes extra HW4-style bit changes, speed profile writing in `1021 mux 2`, and optional approaching-emergency-vehicle behavior.
+- `LEGACY` code path still exists and uses older CAN IDs (`69`, `1006`).
+- These extra handlers increase code size and behavior surface compared with the HW3-only branches.
+
+### CAN Stability
+
+- CAN runs through MCP2515 `readMessage()` / `sendMessage()`.
+- No TWAI alert handling, bus-off recovery, or ESP32 hardware filtering exists because this is not an ESP32/TWAI branch.
+- No short TX retry wrapper is implemented around `sendMessage()`.
+- This branch is best treated as the full RP2040 reference, not the most optimized runtime.
+
+### When To Use
+
+Use this branch when you want the original RP2040 full-feature reference with HW3 speed offset plus preserved HW4/Legacy code paths.
 
 ---
 
@@ -50,34 +98,82 @@ This branch is useful as the original RP2040 full-feature reference. It is not t
 
 ### 概述
 
-`RP2040CAN-FSD` 是原始的 RP2040 + MCP2515 CAN 草图。它保留了较完整的 FSD 代码路径，并通过编译期开关支持多个车型处理器。
+`RP2040CAN-FSD` 是原始 RP2040 + MCP2515 全功能/参考分支。它保留较老的多处理器结构，可以通过编译期宏选择 HW3、HW4 或 Legacy 行为。
+
+这个分支适合作为参考实现，因为功能保留得比较完整；但它不是代码最少、稳定性保护最多的分支。
 
 ### 目标硬件
 
 - MCU：RP2040 开发板
 - CAN 控制器：MCP2515，走 SPI
 - CAN 速率：500 kbps
+- MCP2515 晶振：16 MHz
 - 默认 CAN CS：板级宏 `PIN_CAN_CS`
-- 其他 CAN 引脚：`PIN_CAN_INTERRUPT`、`PIN_CAN_STANDBY`、`PIN_CAN_RESET`
+- 草图还使用这些板级宏：`PIN_CAN_INTERRUPT`、`PIN_CAN_STANDBY`、`PIN_CAN_RESET`、`PIN_LED`
 
-### 主要功能
+### 编译目标
 
-- 源码内包含 HW3、HW4、Legacy 处理逻辑。
-- 默认编译目标是 `HW3`。
-- 读取跟车距离帧，并映射为 `speedProfile`。
-- 处理 FSD 相关控制帧。
-- 从 `0x399` 读取融合限速。
-- 根据限速计算目标速度档，并把速度偏移写入控制帧。
-- 使用 MCP2515 的 `sendMessage()` / `readMessage()` 进行 CAN 收发。
+- 源码默认目标：`HW3`
+- 源码内仍保留：`HW4`、`LEGACY`
+- 只能通过编译期宏 `#define HW3`、`#define HW4` 或 `#define LEGACY` 切换。
 
-### 当前行为
+### HW3 CAN 功能
 
-- HW3 跟车距离来源：CAN ID `1016`。
-- HW3 FSD 控制来源：CAN ID `1021`。
-- 融合限速来源：CAN ID `0x399`。
-- 速度偏移编码：旧版绝对偏移方式，`offset * 10`。
-- 计算偏移最大夹紧：`25`。
+| CAN ID | 功能 | 行为 |
+|--------|------|------|
+| `1016` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
+| `1021 mux 0` | FSD/速度档控制 | 设置 bit `46`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后重发。 |
+| `1021 mux 1` | 控制/提示位 | 清除 bit `19`，然后重发。 |
+| `1021 mux 2` | 速度偏移 | 写入计算后的速度偏移 raw 值。 |
+| `0x399` | 融合限速 | 读取 `data[1] & 0x1F`；`0` 和 `31` 视为无效；有效 raw 乘以 `5`。 |
 
-### 说明
+### HW3 跟车距离映射
 
-这个分支适合作为 RP2040 全功能原始参考。它不是最精简版本：仍保留多车型处理逻辑、旧运行期开关，并且因为目标是 MCP2515，所以没有 ESP32 TWAI 的稳定性恢复功能。
+| 跟车距离 raw 值 | 写入的 `speedProfile` | 固件效果 |
+|-----------------|------------------------|----------|
+| `1` | `2` | 更激进速度档 |
+| `2` | `1` | 中间/默认速度档 |
+| `3` | `0` | 更柔和速度档 |
+| 其他值 | 不变 | 保持上一档 |
+
+### HW3 限速偏移逻辑
+
+源码变量名写的是 `Mph`，但融合限速来源是 `raw * 5`，与常见融合限速步进一致。下面的数值可理解为 `0x399` 的固件单位；本分支原代码把它命名为 mph。
+
+默认目标速度档：
+
+| 融合限速值 | 目标值 | 夹紧前绝对偏移 |
+|------------|--------|----------------|
+| `< 60` | `60` | `60 - 限速` |
+| `60..79` | `80` | `80 - 限速` |
+| `80..99` | `100` | `100 - 限速` |
+| `100..119` | `120` | `120 - 限速` |
+| `>= 120` | 等于限速 | `0` |
+
+偏移规则：
+
+- 计算偏移夹紧到 `0..25`。
+- 线上 raw 值为 `offset * 10`。
+- raw 值再夹紧到 `0..255`。
+- 例：限速 `50` -> 目标 `60` -> 偏移 `10` -> raw `100`。
+- 例：限速 `60` -> 目标 `80` -> 偏移 `20` -> raw `200`。
+- 例：限速 `90` -> 目标 `100` -> 偏移 `10` -> raw `100`。
+- 无有效融合限速时，回退使用 `1021 mux 0` 中解析出的原车 offset。
+- 源码内有固定 raw 测试值：`FIXED_OFFSET_TEST_RAW = 40`，默认关闭。
+
+### HW4 / Legacy 说明
+
+- `HW4` 路径仍在，包含 HW4 风格 bit 修改、`1021 mux 2` 速度档写入，以及可选紧急车辆接近相关行为。
+- `LEGACY` 路径仍在，使用较老 CAN ID（`69`、`1006`）。
+- 这些额外路径让代码量和行为面都比 HW3-only 分支更大。
+
+### CAN 稳定性
+
+- CAN 通过 MCP2515 的 `readMessage()` / `sendMessage()` 收发。
+- 因为不是 ESP32/TWAI 分支，所以没有 TWAI alert、bus-off 恢复、ESP32 硬件过滤。
+- `sendMessage()` 外层没有短重试逻辑。
+- 这个分支更适合作为 RP2040 全功能参考，不是最优化运行版本。
+
+### 适用场景
+
+如果你需要原始 RP2040 全功能参考，包含 HW3 速度偏移，并保留 HW4/Legacy 代码路径，使用这个分支。
