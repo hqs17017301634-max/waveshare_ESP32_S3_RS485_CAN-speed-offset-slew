@@ -17,8 +17,7 @@
 
 // This build supports the HW3 car only.
 
-bool enableAutoOffsetFromFusedSpeedLimit = true;
-bool enableFixedOffsetRawTest = false;
+constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
 
 // Pin assignments — overridable via PlatformIO build_flags (-D...).
 // Defaults match the Waveshare ESP32-S3-RS485-CAN board.
@@ -48,7 +47,6 @@ constexpr int MAX_SPEED_OFFSET_KPH = 25;     // absolute pre-clamp on the comput
 constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
 constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
 constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 15;
-constexpr uint8_t FIXED_OFFSET_TEST_RAW = 40;
 constexpr uint32_t TWAI_ALERT_MASK =
   TWAI_ALERT_BUS_OFF |
   TWAI_ALERT_BUS_RECOVERED |
@@ -178,6 +176,17 @@ static inline bool isRelevantCanId(uint32_t canId) {
          canId == CAN_ID_AP_CONTROL;
 }
 
+// Hardware acceptance filter — a coarse pre-filter so the controller only
+// enqueues the IDs near our targets instead of the whole bus; isRelevantCanId()
+// still does the exact 3-ID match. Derived from the only IDs we touch:
+//   0x399 (921), 0x3F8 (1016), 0x3FD (1021).
+// Their common must-match bits give acceptance code 0x398; the differing ID
+// bits {0,2,5,6} (mask 0x79A marks the must-match bits) are "don't care", so
+// exactly 16 IDs in 0x398..0x3FD pass. Standard 11-bit IDs sit in bits [31:21];
+// in twai_filter_config_t a mask bit of 1 means "don't care".
+constexpr uint32_t CAN_ACCEPT_CODE = static_cast<uint32_t>(0x398) << 21;
+constexpr uint32_t CAN_ACCEPT_MASK = ~(static_cast<uint32_t>(0x79A) << 21);
+
 // ---- Unified speed compensation ----
 
 struct UnifiedSpeedCompensationPort {
@@ -281,18 +290,14 @@ struct OffsetSlewLimiter {
 struct HW3Handler {
   int speedProfile = 1;
   bool FSDEnabled = true;
-  int fallbackSpeedOffsetKph = 0;
   UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
   OffsetSlewLimiter offsetSlewLimiter{};
-
-  void setFallbackSpeedOffsetKph(int offsetKph) {
-    fallbackSpeedOffsetKph = offsetKph;
-  }
 
   void refreshUnifiedSpeedCompensation() {
     unifiedSpeedCompensation.hasFusedSpeedLimit = false;
     unifiedSpeedCompensation.fusedSpeedLimitKph = 0;
     unifiedSpeedCompensation.targetSpeedKph = 0;
+    unifiedSpeedCompensation.offsetKph = 0;
     unifiedSpeedCompensation.speedOffsetRaw = 0;
     if (enableAutoOffsetFromFusedSpeedLimit) {
       int fusedSpeedLimitValue = 0;
@@ -307,10 +312,8 @@ struct HW3Handler {
         unifiedSpeedCompensation.speedOffsetRaw = encodeSpeedOffsetRawPct4(
           unifiedSpeedCompensation.offsetKph,
           unifiedSpeedCompensation.fusedSpeedLimitKph);
-        return;
       }
     }
-    unifiedSpeedCompensation.offsetKph = clampOffsetKph(fallbackSpeedOffsetKph);
   }
 
   void handelMessage(can_frame& frame) {
@@ -328,10 +331,6 @@ struct HW3Handler {
       if (frame.can_dlc < 8) return;
       auto index = readMuxID(frame);
       if (index == 0 && FSDEnabled) {
-        int offsetRaw = (frame.data[3] >> 1) & 0x3F;
-        int offsetKph = std::max(0, std::min((offsetRaw - 30) * 5, 100));
-        setFallbackSpeedOffsetKph(offsetKph);
-        refreshUnifiedSpeedCompensation();
         setBit(frame, 46, true);
         setSpeedProfileV12V13(frame, speedProfile);
         twai_send(frame);
@@ -341,11 +340,9 @@ struct HW3Handler {
         twai_send(frame);
       }
       if (index == 2 && FSDEnabled) {
-        uint8_t speedOffsetRaw = enableFixedOffsetRawTest
-          ? FIXED_OFFSET_TEST_RAW
-          : (unifiedSpeedCompensation.hasFusedSpeedLimit
-            ? unifiedSpeedCompensation.speedOffsetRaw
-            : readSpeedOffsetRaw(frame));
+        uint8_t speedOffsetRaw = unifiedSpeedCompensation.hasFusedSpeedLimit
+          ? unifiedSpeedCompensation.speedOffsetRaw
+          : readSpeedOffsetRaw(frame);
         speedOffsetRaw = offsetSlewLimiter.apply(speedOffsetRaw);
         writeSpeedOffsetRaw(frame, speedOffsetRaw);
         twai_send(frame);
@@ -371,7 +368,7 @@ void setup() {
   g_config.rx_queue_len = TWAI_RX_QUEUE_LEN;
   g_config.tx_queue_len = TWAI_TX_QUEUE_LEN;
   twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
-  twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  twai_filter_config_t  f_config = { CAN_ACCEPT_CODE, CAN_ACCEPT_MASK, true };
 
   twai_driver_install(&g_config, &t_config, &f_config);
   twai_start();
