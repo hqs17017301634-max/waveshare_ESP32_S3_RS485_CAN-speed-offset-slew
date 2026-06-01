@@ -6,7 +6,7 @@
 
 static const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>T-2CAN FSD</title>
+<title>T-2CAN FSD 设置</title>
 <style>
 body{font-family:system-ui,Arial,sans-serif;margin:0;padding:12px;background:#111;color:#eee}
 h1{font-size:18px}h2{font-size:15px;margin:14px 0 6px;color:#8cf}
@@ -18,46 +18,46 @@ button.alt{background:#37c}button.warn{background:#a33}
 .kv{display:flex;justify-content:space-between;font-size:13px;padding:2px 0;border-bottom:1px solid #262626}
 .kv span:last-child{color:#9f9;font-variant-numeric:tabular-nums}
 </style></head><body>
-<h1>T-2CAN FSD &middot; runtime settings</h1>
+<h1>T-2CAN FSD &middot; 运行参数</h1>
 
 <div class="card">
-<h2>Config</h2>
-<label>FSD enabled<input type="checkbox" id="fsdEnabled"></label>
-<label>Auto speed offset<input type="checkbox" id="autoSpeedOffsetEnabled"></label>
-<label>Slew %/s<input type="number" id="slewPctPerSec" min="0" max="100"></label>
-<label>Low-speed max PCT4 raw<input type="number" id="lowSpeedMaxPctRaw" min="0" max="255"></label>
-<label>Target &lt;60<input type="number" id="targetBelow60" min="0" max="255"></label>
-<label>Target 60..69<input type="number" id="target60" min="0" max="255"></label>
-<label>Target 70..79<input type="number" id="target70" min="0" max="255"></label>
-<label>Target 80..89<input type="number" id="target80" min="0" max="255"></label>
-<label>Target 90..99<input type="number" id="target90" min="0" max="255"></label>
-<label>Target 100..119<input type="number" id="target100" min="0" max="255"></label>
-<label>Target 120..139<input type="number" id="target120" min="0" max="255"></label>
-<label>CAN B enabled<input type="checkbox" id="canbEnabled"></label>
-<label>CAN B service mode<input type="checkbox" id="canbServiceModeEnabled"></label>
-<label>CAN B filter (reserved)<input type="checkbox" id="canbFilterEnabled"></label>
+<h2>配置</h2>
+<label>FSD 启用<input type="checkbox" id="fsdEnabled"></label>
+<label>自动限速偏移<input type="checkbox" id="autoSpeedOffsetEnabled"></label>
+<label>缓降 %/秒<input type="number" id="slewPctPerSec" min="0" max="100"></label>
+<label>低速上限 PCT4 raw<input type="number" id="lowSpeedMaxPctRaw" min="0" max="255"></label>
+<label>目标 &lt;60<input type="number" id="targetBelow60" min="0" max="255"></label>
+<label>目标 60..69<input type="number" id="target60" min="0" max="255"></label>
+<label>目标 70..79<input type="number" id="target70" min="0" max="255"></label>
+<label>目标 80..89<input type="number" id="target80" min="0" max="255"></label>
+<label>目标 90..99<input type="number" id="target90" min="0" max="255"></label>
+<label>目标 100..119<input type="number" id="target100" min="0" max="255"></label>
+<label>目标 120..139<input type="number" id="target120" min="0" max="255"></label>
+<label>CAN B 启用<input type="checkbox" id="canbEnabled"></label>
+<label>CAN B Service Mode<input type="checkbox" id="canbServiceModeEnabled"></label>
+<label>CAN B 过滤（预留）<input type="checkbox" id="canbFilterEnabled"></label>
 <div>
-<button onclick="applyConfig()">Apply (RAM)</button>
-<button class="alt" onclick="saveConfig()">Save (Flash)</button>
-<button class="warn" onclick="webOff()">Close WebUI</button>
+<button onclick="applyConfig()">应用（内存）</button>
+<button class="alt" onclick="saveConfig()">保存（Flash）</button>
+<button class="warn" onclick="webOff()">关闭 WebUI</button>
 </div>
 </div>
 
 <div class="card">
-<h2>Status <label style="display:inline;font-size:13px">poll<input type="checkbox" id="poll" onchange="setPolling(this.checked)"></label></h2>
-<div class="kv"><span>CAN1 RX</span><span id="can1Rx">-</span></div>
-<div class="kv"><span>CAN1 TX</span><span id="can1Tx">-</span></div>
-<div class="kv"><span>CAN1 TX fail</span><span id="can1TxFail">-</span></div>
-<div class="kv"><span>TWAI bus-off</span><span id="twaiBusOffCount">-</span></div>
-<div class="kv"><span>Fused limit kph</span><span id="fusedLimitKph">-</span></div>
-<div class="kv"><span>Target kph</span><span id="targetSpeedKph">-</span></div>
-<div class="kv"><span>Offset kph</span><span id="offsetKph">-</span></div>
-<div class="kv"><span>Offset raw</span><span id="offsetRaw">-</span></div>
-<div class="kv"><span>CAN B RX</span><span id="canbRx">-</span></div>
-<div class="kv"><span>CAN B TX</span><span id="canbTx">-</span></div>
-<div class="kv"><span>CAN B TX fail</span><span id="canbTxFail">-</span></div>
-<div class="kv"><span>CAN B last ID</span><span id="canbLastId">-</span></div>
-<div class="kv"><span>Uptime s</span><span id="uptime">-</span></div>
+<h2>状态 <label style="display:inline;font-size:13px">轮询<input type="checkbox" id="poll" onchange="setPolling(this.checked)"></label></h2>
+<div class="kv"><span>CAN1 接收</span><span id="can1Rx">-</span></div>
+<div class="kv"><span>CAN1 发送</span><span id="can1Tx">-</span></div>
+<div class="kv"><span>CAN1 发送失败</span><span id="can1TxFail">-</span></div>
+<div class="kv"><span>TWAI bus-off 次数</span><span id="twaiBusOffCount">-</span></div>
+<div class="kv"><span>融合限速 kph</span><span id="fusedLimitKph">-</span></div>
+<div class="kv"><span>目标速度 kph</span><span id="targetSpeedKph">-</span></div>
+<div class="kv"><span>偏移 kph</span><span id="offsetKph">-</span></div>
+<div class="kv"><span>偏移 raw</span><span id="offsetRaw">-</span></div>
+<div class="kv"><span>CAN B 接收</span><span id="canbRx">-</span></div>
+<div class="kv"><span>CAN B 发送</span><span id="canbTx">-</span></div>
+<div class="kv"><span>CAN B 发送失败</span><span id="canbTxFail">-</span></div>
+<div class="kv"><span>CAN B 最后 ID</span><span id="canbLastId">-</span></div>
+<div class="kv"><span>运行时间 秒</span><span id="uptime">-</span></div>
 </div>
 
 <script>
