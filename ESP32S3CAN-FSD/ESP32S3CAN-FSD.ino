@@ -41,12 +41,18 @@ constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
 
 constexpr int AUTO_TARGET_SPEED = 60;
 constexpr int AUTO_TARGET_SPEED_AT_80 = 80;
+constexpr int AUTO_TARGET_SPEED_AT_85 = 85;
+constexpr int AUTO_TARGET_SPEED_AT_90 = 90;
 constexpr int AUTO_TARGET_SPEED_AT_100 = 100;
 constexpr int AUTO_TARGET_SPEED_AT_120 = 120;
+constexpr int AUTO_TARGET_SPEED_AT_140 = 140;
+constexpr int LOW_SPEED_MAX_PCT_LIMIT_KPH = 50;
 constexpr int MAX_SPEED_OFFSET_KPH = 25;     // absolute pre-clamp on the computed offset
 constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
 constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
-constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 15;
+constexpr uint8_t LOW_SPEED_MAX_PCT_RAW =
+  static_cast<uint8_t>(MAX_SPEED_OFFSET_PCT * OFFSET_PCT4_RAW_PER_PCT);
+constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 5;
 constexpr uint32_t TWAI_ALERT_MASK =
   TWAI_ALERT_BUS_OFF |
   TWAI_ALERT_BUS_RECOVERED |
@@ -247,9 +253,12 @@ inline uint8_t encodeSpeedOffsetRawPct4(int offsetKph, int fusedSpeedLimitKph) {
 
 inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
   if (fusedSpeedLimitValue < 60)  return AUTO_TARGET_SPEED;
-  if (fusedSpeedLimitValue < 80)  return AUTO_TARGET_SPEED_AT_80;
+  if (fusedSpeedLimitValue < 70)  return AUTO_TARGET_SPEED_AT_80;
+  if (fusedSpeedLimitValue < 80)  return AUTO_TARGET_SPEED_AT_85;
+  if (fusedSpeedLimitValue < 90)  return AUTO_TARGET_SPEED_AT_90;
   if (fusedSpeedLimitValue < 100) return AUTO_TARGET_SPEED_AT_100;
   if (fusedSpeedLimitValue < 120) return AUTO_TARGET_SPEED_AT_120;
+  if (fusedSpeedLimitValue < 140) return AUTO_TARGET_SPEED_AT_140;
   return fusedSpeedLimitValue;
 }
 
@@ -309,9 +318,12 @@ struct HW3Handler {
           ? (unifiedSpeedCompensation.targetSpeedKph - fusedSpeedLimitValue)
           : 0;
         unifiedSpeedCompensation.offsetKph = clampOffsetKph(desiredOffsetKph);
-        unifiedSpeedCompensation.speedOffsetRaw = encodeSpeedOffsetRawPct4(
-          unifiedSpeedCompensation.offsetKph,
-          unifiedSpeedCompensation.fusedSpeedLimitKph);
+        unifiedSpeedCompensation.speedOffsetRaw =
+          fusedSpeedLimitValue < LOW_SPEED_MAX_PCT_LIMIT_KPH
+            ? LOW_SPEED_MAX_PCT_RAW
+            : encodeSpeedOffsetRawPct4(
+                unifiedSpeedCompensation.offsetKph,
+                unifiedSpeedCompensation.fusedSpeedLimitKph);
       }
     }
   }

@@ -81,11 +81,15 @@ On `1021 mux 2`:
 
 | Fused speed limit | Target speed | Maximum desired boost before clamp |
 |-------------------|--------------|------------------------------------|
-| `< 60 kph` | `60 kph` | `60 - limit` |
-| `60..79 kph` | `80 kph` | `80 - limit` |
-| `80..99 kph` | `100 kph` | `100 - limit` |
+| `< 50 kph` | capped `50%` | raw `200` |
+| `50..59 kph` | `60 kph` | `60 - limit` |
+| `60..69 kph` | `80 kph` | `80 - limit` |
+| `70..79 kph` | `85 kph` | `85 - limit` |
+| `80..89 kph` | `90 kph` | `90 - limit` |
+| `90..99 kph` | `100 kph` | `100 - limit` |
 | `100..119 kph` | `120 kph` | `120 - limit` |
-| `>= 120 kph` | same as limit | `0 kph` |
+| `120..139 kph` | `140 kph` | `140 - limit` |
+| `>= 140 kph` | same as limit | `0 kph` |
 
 ### Speed Offset Rules
 
@@ -101,21 +105,24 @@ Examples with the default table:
 | Fused limit | Target | Offset after clamp | Percent | PCT4 raw |
 |-------------|--------|--------------------|---------|----------|
 | `30 kph` | `60 kph` | `25 kph` | capped to `50%` | `200` |
+| `45 kph` | capped `50%` | n/a | `50%` | `200` |
 | `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
+| `55 kph` | `60 kph` | `5 kph` | `9%` | `36` |
 | `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
-| `75 kph` | `80 kph` | `5 kph` | `7%` | `28` |
-| `80 kph` | `100 kph` | `20 kph` | `25%` | `100` |
-| `95 kph` | `100 kph` | `5 kph` | `5%` | `20` |
+| `70 kph` | `85 kph` | `15 kph` | `21%` | `84` |
+| `75 kph` | `85 kph` | `10 kph` | `13%` | `52` |
+| `80 kph` | `90 kph` | `10 kph` | `13%` | `52` |
+| `90 kph` | `100 kph` | `10 kph` | `11%` | `44` |
 | `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
-| `115 kph` | `120 kph` | `5 kph` | `4%` | `16` |
-| `120 kph+` | same as limit | `0 kph` | `0%` | `0` |
+| `120 kph` | `140 kph` | `20 kph` | `17%` | `68` |
+| `140 kph+` | same as limit | `0 kph` | `0%` | `0` |
 
 ### Slew Limiter
 
 The slew limiter only limits downward raw changes, because sudden loss of offset can feel like sudden deceleration.
 
-- Default downward limit: `15%/s`.
-- PCT4 raw rate: `15 * 4 = 60 raw units/s`.
+- Default downward limit: `5%/s`.
+- PCT4 raw rate: `5 * 4 = 20 raw units/s`.
 - Rising offset changes pass immediately.
 - If fused speed limit suddenly drops and target raw goes lower, the firmware ramps downward instead of jumping directly.
 
@@ -244,11 +251,15 @@ Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FS
 
 | 融合限速 | 目标速度 | 夹紧前最大期望提升 |
 |----------|----------|--------------------|
-| `< 60 kph` | `60 kph` | `60 - 限速` |
-| `60..79 kph` | `80 kph` | `80 - 限速` |
-| `80..99 kph` | `100 kph` | `100 - 限速` |
+| `< 50 kph` | 夹到 `50%` | raw `200` |
+| `50..59 kph` | `60 kph` | `60 - 限速` |
+| `60..69 kph` | `80 kph` | `80 - 限速` |
+| `70..79 kph` | `85 kph` | `85 - 限速` |
+| `80..89 kph` | `90 kph` | `90 - 限速` |
+| `90..99 kph` | `100 kph` | `100 - 限速` |
 | `100..119 kph` | `120 kph` | `120 - 限速` |
-| `>= 120 kph` | 等于限速 | `0 kph` |
+| `120..139 kph` | `140 kph` | `140 - 限速` |
+| `>= 140 kph` | 等于限速 | `0 kph` |
 
 ### 速度偏移规则
 
@@ -264,21 +275,24 @@ Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FS
 | 融合限速 | 目标 | 夹紧后偏移 | 百分比 | PCT4 raw |
 |----------|------|------------|--------|----------|
 | `30 kph` | `60 kph` | `25 kph` | 夹到 `50%` | `200` |
+| `45 kph` | 夹到 `50%` | n/a | `50%` | `200` |
 | `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
+| `55 kph` | `60 kph` | `5 kph` | `9%` | `36` |
 | `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
-| `75 kph` | `80 kph` | `5 kph` | `7%` | `28` |
-| `80 kph` | `100 kph` | `20 kph` | `25%` | `100` |
-| `95 kph` | `100 kph` | `5 kph` | `5%` | `20` |
+| `70 kph` | `85 kph` | `15 kph` | `21%` | `84` |
+| `75 kph` | `85 kph` | `10 kph` | `13%` | `52` |
+| `80 kph` | `90 kph` | `10 kph` | `13%` | `52` |
+| `90 kph` | `100 kph` | `10 kph` | `11%` | `44` |
 | `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
-| `115 kph` | `120 kph` | `5 kph` | `4%` | `16` |
-| `120 kph+` | 等于限速 | `0 kph` | `0%` | `0` |
+| `120 kph` | `140 kph` | `20 kph` | `17%` | `68` |
+| `140 kph+` | 等于限速 | `0 kph` | `0%` | `0` |
 
 ### Slew 限幅
 
 Slew 限幅只限制 raw 下降，因为偏移突然消失可能带来突然减速体感。
 
-- 默认下降限幅：`15%/秒`。
-- PCT4 raw 下降速率：`15 * 4 = 60 raw/秒`。
+- 默认下降限幅：`5%/秒`。
+- PCT4 raw 下降速率：`5 * 4 = 20 raw/秒`。
 - 偏移上升立即放行。
 - 当融合限速突然变化导致目标 raw 降低时，固件会平滑下降，而不是直接跳到低值。
 
