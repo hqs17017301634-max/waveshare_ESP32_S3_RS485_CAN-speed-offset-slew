@@ -8,14 +8,15 @@
 
     CAN-only build for Waveshare ESP32-S3-RS485-CAN (16MB flash).
     WiFi and Bluetooth are never initialized, so both radios stay powered down.
-    Only stable CAN messaging + FSD activation / speed control is kept.
+    HW4 (FSD V14) only: FSD activation + follow-distance speed profile +
+    fused-speed-limit speed offset (HW4 wire format) with downward slew limiting.
 */
 
 #include <algorithm>
 #include <cstring>
 #include <driver/twai.h>
 
-// This build supports the HW3 car only.
+// This build supports the HW4 (FSD V14) car only.
 
 constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
 
@@ -46,13 +47,16 @@ constexpr int AUTO_TARGET_SPEED_AT_90 = 90;
 constexpr int AUTO_TARGET_SPEED_AT_100 = 100;
 constexpr int AUTO_TARGET_SPEED_AT_120 = 120;
 constexpr int AUTO_TARGET_SPEED_AT_140 = 140;
-constexpr int LOW_SPEED_MAX_PCT_LIMIT_KPH = 50;
-constexpr int MAX_SPEED_OFFSET_KPH = 25;     // absolute pre-clamp on the computed offset
-constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
-constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
-constexpr uint8_t LOW_SPEED_MAX_PCT_RAW =
-  static_cast<uint8_t>(MAX_SPEED_OFFSET_PCT * OFFSET_PCT4_RAW_PER_PCT);
-constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 5;
+constexpr int MAX_SPEED_OFFSET_KPH = 25;        // absolute pre-clamp on the computed offset
+// HW4 speed-offset wire encoding (1021 mux 2, data[1] bits 0..5 — a 6-bit field).
+// Matches the ev-open-can-tools HW4 presets: raw = round(offset * 1.4).
+//   +5 -> 7, +7 -> 10, +10 -> 14, +15 -> 21
+constexpr int     OFFSET_HW4_RAW_NUM = 14;       // x1.4 numerator
+constexpr int     OFFSET_HW4_RAW_DEN = 10;       // x1.4 denominator
+constexpr uint8_t OFFSET_HW4_RAW_MAX = 0x3F;     // 6-bit field cap
+constexpr uint8_t OFFSET_SLEW_RATE_RAW_PER_SEC = 7;  // downward slew ~5 kph/sec
+// Approaching-emergency-vehicle detection (HW4 FSD V14, 1021 mux 0 bit 59).
+constexpr bool ENABLE_APPROACHING_EMERGENCY_VEHICLE_DETECTION = true;
 constexpr uint32_t TWAI_ALERT_MASK =
   TWAI_ALERT_BUS_OFF |
   TWAI_ALERT_BUS_RECOVERED |
@@ -229,11 +233,6 @@ SpeedLimitMonitor speedLimitMonitor;
 
 inline uint8_t readMuxID(const can_frame& frame) { return frame.data[0] & 0x07; }
 
-inline void setSpeedProfileV12V13(can_frame& frame, int profile) {
-  frame.data[6] &= ~0x06;
-  frame.data[6] |= (profile << 1);
-}
-
 inline void setBit(can_frame& frame, int bit, bool value) {
   int byteIndex = bit / 8;
   int bitIndex = bit % 8;
@@ -244,11 +243,10 @@ inline void setBit(can_frame& frame, int bit, bool value) {
 
 inline int clampOffsetKph(int value) { return std::max(std::min(value, MAX_SPEED_OFFSET_KPH), 0); }
 
-inline uint8_t encodeSpeedOffsetRawPct4(int offsetKph, int fusedSpeedLimitKph) {
-  if (fusedSpeedLimitKph <= 0) return 0;
-  int pct = (offsetKph * 100 + fusedSpeedLimitKph / 2) / fusedSpeedLimitKph;
-  pct = std::max(std::min(pct, MAX_SPEED_OFFSET_PCT), 0);
-  return static_cast<uint8_t>(pct * OFFSET_PCT4_RAW_PER_PCT);
+inline uint8_t encodeSpeedOffsetRawHw4(int offsetKph) {
+  if (offsetKph <= 0) return 0;
+  int raw = (offsetKph * OFFSET_HW4_RAW_NUM + OFFSET_HW4_RAW_DEN / 2) / OFFSET_HW4_RAW_DEN;
+  return static_cast<uint8_t>(std::min(raw, static_cast<int>(OFFSET_HW4_RAW_MAX)));
 }
 
 inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
@@ -262,13 +260,18 @@ inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
   return fusedSpeedLimitValue;
 }
 
+// HW4 speed offset lives only in 1021 mux 2 data[1] bits 0..5 (6-bit field).
 inline uint8_t readSpeedOffsetRaw(const can_frame& frame) {
-  return static_cast<uint8_t>(((frame.data[1] & 0x3F) << 2) | ((frame.data[0] >> 6) & 0x03));
+  return static_cast<uint8_t>(frame.data[1] & 0x3F);
 }
 
 inline void writeSpeedOffsetRaw(can_frame& frame, uint8_t raw) {
-  frame.data[0] = static_cast<uint8_t>((frame.data[0] & ~0xC0) | ((raw & 0x03) << 6));
-  frame.data[1] = static_cast<uint8_t>((frame.data[1] & ~0x3F) | (raw >> 2));
+  frame.data[1] = static_cast<uint8_t>((frame.data[1] & ~0x3F) | (raw & 0x3F));
+}
+
+// HW4 writes the speed profile into 1021 mux 2 data[7] bits 4..6.
+inline void setSpeedProfileHw4(can_frame& frame, int profile) {
+  frame.data[7] = static_cast<uint8_t>((frame.data[7] & ~(0x07 << 4)) | ((profile & 0x07) << 4));
 }
 
 struct OffsetSlewLimiter {
@@ -280,8 +283,7 @@ struct OffsetSlewLimiter {
     const uint32_t now = millis();
 
     if (targetRaw < lastRaw && lastSentMs != 0) {
-      const uint32_t rateRawPerSec =
-        static_cast<uint32_t>(OFFSET_SLEW_RATE_PCT_PER_SEC) * OFFSET_PCT4_RAW_PER_PCT;
+      const uint32_t rateRawPerSec = OFFSET_SLEW_RATE_RAW_PER_SEC;
       const uint32_t elapsedMs = now - lastSentMs;
       const uint32_t maxDrop = (rateRawPerSec * elapsedMs + 500U) / 1000U;
       const uint8_t floorRaw = lastRaw > maxDrop ? static_cast<uint8_t>(lastRaw - maxDrop) : 0;
@@ -294,9 +296,9 @@ struct OffsetSlewLimiter {
   }
 };
 
-// ---- HW3 car handler ----
+// ---- HW4 car handler ----
 
-struct HW3Handler {
+struct HW4Handler {
   int speedProfile = 1;
   bool FSDEnabled = true;
   UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
@@ -319,11 +321,7 @@ struct HW3Handler {
           : 0;
         unifiedSpeedCompensation.offsetKph = clampOffsetKph(desiredOffsetKph);
         unifiedSpeedCompensation.speedOffsetRaw =
-          fusedSpeedLimitValue < LOW_SPEED_MAX_PCT_LIMIT_KPH
-            ? LOW_SPEED_MAX_PCT_RAW
-            : encodeSpeedOffsetRawPct4(
-                unifiedSpeedCompensation.offsetKph,
-                unifiedSpeedCompensation.fusedSpeedLimitKph);
+          encodeSpeedOffsetRawHw4(unifiedSpeedCompensation.offsetKph);
       }
     }
   }
@@ -331,11 +329,15 @@ struct HW3Handler {
   void handelMessage(can_frame& frame) {
     if (frame.can_id == CAN_ID_FOLLOW_DISTANCE) {
       if (frame.can_dlc < 6) return;
+      // Follow-distance (CAN raw = UI distance - 1) -> HW4 speed profile / style.
+      // Profile value semantics: 0=Chill 1=Normal 2=Hurry 3=Max 4=Sloth.
       uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
       switch (followDistance) {
-        case 1: speedProfile = 2; break;
-        case 2: speedProfile = 1; break;
-        case 3: speedProfile = 0; break;
+        case 1: speedProfile = 3; break;  // UI 2 -> Max
+        case 2: speedProfile = 2; break;  // UI 3 -> Hurry
+        case 3: speedProfile = 1; break;  // UI 4 -> Normal
+        case 4: speedProfile = 0; break;  // UI 5 -> Chill
+        case 5: speedProfile = 4; break;  // UI 6 -> Sloth
       }
       return;
     }
@@ -343,15 +345,19 @@ struct HW3Handler {
       if (frame.can_dlc < 8) return;
       auto index = readMuxID(frame);
       if (index == 0 && FSDEnabled) {
-        setBit(frame, 46, true);
-        setSpeedProfileV12V13(frame, speedProfile);
+        setBit(frame, 46, true);   // UI_autosteerEnabled
+        setBit(frame, 60, true);   // HW4 extended enable
+        if (ENABLE_APPROACHING_EMERGENCY_VEHICLE_DETECTION) setBit(frame, 59, true);
         twai_send(frame);
       }
       if (index == 1) {
         setBit(frame, 19, false);
+        setBit(frame, 47, true);
         twai_send(frame);
       }
       if (index == 2 && FSDEnabled) {
+        // HW4 mux 2 carries both the speed profile (data[7]) and the speed offset (data[1]).
+        setSpeedProfileHw4(frame, speedProfile);
         uint8_t speedOffsetRaw = unifiedSpeedCompensation.hasFusedSpeedLimit
           ? unifiedSpeedCompensation.speedOffsetRaw
           : readSpeedOffsetRaw(frame);
@@ -365,7 +371,7 @@ struct HW3Handler {
 
 // ---- Main ----
 
-HW3Handler handler;
+HW4Handler handler;
 
 void setup() {
   pinMode(PIN_LED, OUTPUT);
