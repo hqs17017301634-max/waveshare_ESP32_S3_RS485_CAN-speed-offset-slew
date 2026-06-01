@@ -162,6 +162,64 @@ pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_f
 pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
 ```
 
+### LILYGO T-2CAN (dual CAN)
+
+The `T-2CAN` branch also targets the **LILYGO T-2CAN** board, which exposes two
+CAN buses. It stays on the Arduino/PlatformIO framework and the same single fast
+`loop()`; CAN A remains the primary, time-critical FSD bus.
+
+| Bus | Controller | Pins | Connector | Role |
+|-----|------------|------|-----------|------|
+| CAN A / CAN1 | ESP32-S3 native TWAI | TX `GPIO7`, RX `GPIO6` | X197 Pin 13/14 | FSD activation + speed-limit modification (unchanged) |
+| CAN B / CAN2 | MCP2515 over SPI | SCK `GPIO12`, MOSI `GPIO11`, MISO `GPIO13`, CS `GPIO10`, RST `GPIO9`, 16 MHz xtal | X197/X179 Pin 9/10 | Second auxiliary CAN (basic RX/TX/counters + service mode) |
+
+- All pins come from PlatformIO `build_flags` (`-DTWAI_*`, `-DMCP2515_*`); no
+  LilyGO pin is hard-coded in the firmware.
+- CAN A keeps every existing feature: `0x399` fused-limit read, `1016` follow
+  distance, `1021 mux0/1/2` FSD activation / bit-19 clear / PCT4 speed offset,
+  the full target-speed table, `5%/s` downward slew, TWAI alerts, bus-off
+  auto-recovery, TX short retry, DLC protection, and the RX filter.
+- CAN B is initialized after TWAI. If the MCP2515 is missing or fails to init it
+  stays disabled and never blocks or disturbs CAN A / FSD. Per loop it drains at
+  most 4 RX frames (stage 1: counts only — no bridging, no logging).
+- **CAN B service mode (`0x339`)**: off by default. Toggling it queues a 4-frame
+  burst at 10 ms spacing (`millis()`-scheduled, never `delay()`), sent only on
+  CAN B (`00 00 00 00 00 80 00 00` to enter, `…00 00` to exit).
+
+Deferred on this branch (not migrated): `0x249` stalk/lighting injection, flash
+bursts, full-rate sniffer, CSV recorder, arbitrary WebUI CAN send, CAN B→CAN A
+bridging, and MITM rewriting.
+
+### Light WebUI (optional)
+
+A minimal SoftAP parameter page can be compiled in with `-DENABLE_LIGHT_WEBUI`
+(the `lilygo_t2can_arduino_webui` env). It is intentionally isolated so it never
+touches the CAN fast path:
+
+- Runs on its own low-priority FreeRTOS task pinned to **core 0**; the CAN
+  `loop()` never waits on HTTP.
+- Endpoints: `GET /`, `GET /status`, `POST /config`, `POST /save`,
+  `POST /web/off`.
+- `/status` only reads a cached status/config snapshot (never triggers CAN);
+  `/config` updates RAM only; `/save` is the only path that writes Flash
+  (`Preferences`).
+- The page **does not poll by default** — polling is opt-in and runs at most once
+  per second; closing the WebUI stops all requests and shuts the SoftAP down.
+- No OTA, no SPIFFS/LittleFS, no recorder, no full sniffer.
+
+### Build & Flash (LILYGO T-2CAN)
+
+```bash
+pio run -e lilygo_t2can_arduino
+pio run -e lilygo_t2can_arduino -t upload --upload-port COMx
+```
+
+WebUI build:
+
+```bash
+pio run -e lilygo_t2can_arduino_webui
+```
+
 ### Full 16 MB BIN
 
 This branch can generate a full merged 16 MB image for flashing from offset `0x0`. A typical local output path is:
@@ -330,6 +388,54 @@ pio run -e waveshare_ESP32_S3_RS485_CAN -t upload
 ```bash
 pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_flash
 pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
+```
+
+### LILYGO T-2CAN（双 CAN）
+
+`T-2CAN` 分支同时支持 **LILYGO T-2CAN** 开发板，该板提供两路 CAN。仍保持
+Arduino/PlatformIO 框架和同一个快速 `loop()`；CAN A 始终是时序关键的主 FSD 通道。
+
+| 总线 | 控制器 | 引脚 | 接口 | 职责 |
+|------|--------|------|------|------|
+| CAN A / CAN1 | ESP32-S3 原生 TWAI | TX `GPIO7`、RX `GPIO6` | X197 Pin 13/14 | FSD 激活 + 限速修改（保持不变） |
+| CAN B / CAN2 | MCP2515（SPI） | SCK `GPIO12`、MOSI `GPIO11`、MISO `GPIO13`、CS `GPIO10`、RST `GPIO9`、16 MHz 晶振 | X197/X179 Pin 9/10 | 第二路辅助 CAN（基础 RX/TX/计数 + Service Mode） |
+
+- 所有引脚来自 PlatformIO `build_flags`（`-DTWAI_*`、`-DMCP2515_*`），固件里不硬编码 LilyGO 引脚。
+- CAN A 保留全部既有功能：`0x399` 融合限速读取、`1016` 跟车距离、`1021 mux0/1/2`
+  FSD 激活 / 清 bit19 / PCT4 限速偏移、完整目标速度表、`5%/秒` 下降缓降、TWAI
+  alert、bus-off 自动恢复、TX 短重试、DLC 保护、RX 过滤。
+- CAN B 在 TWAI 之后初始化；MCP2515 缺失或初始化失败时保持关闭，绝不阻塞或影响
+  CAN A / FSD。每轮 loop 最多读取 4 帧（第一阶段只计数——不桥接、不打印）。
+- **CAN B Service Mode（`0x339`）**：默认关闭。切换时排队发送 4 帧、间隔 10 ms
+  （`millis()` 非阻塞调度，不使用 `delay()`），只发到 CAN B（开启
+  `00 00 00 00 00 80 00 00`，关闭 `…00 00`）。
+
+本分支暂不移植：`0x249` 拨杆/灯光注入、Flash burst、全量 sniffer、CSV recorder、
+WebUI 任意 CAN 发送、CAN B→CAN A 桥接、MITM 改写。
+
+### 轻量 WebUI（可选）
+
+通过 `-DENABLE_LIGHT_WEBUI`（`lilygo_t2can_arduino_webui` 环境）可编译一个最小化的
+SoftAP 参数页面。它被刻意隔离，绝不进入 CAN 快路径：
+
+- 运行在独立的低优先级 FreeRTOS 任务，pin 到 **core 0**；CAN `loop()` 不等待 HTTP。
+- 接口：`GET /`、`GET /status`、`POST /config`、`POST /save`、`POST /web/off`。
+- `/status` 只读缓存的状态/配置快照（绝不触发 CAN）；`/config` 只改 RAM；只有
+  `/save` 才写 Flash（`Preferences`）。
+- 页面**默认不轮询**——轮询需手动开启，最快每秒一次；关闭 WebUI 后停止所有请求并关闭 SoftAP。
+- 不含 OTA、不含 SPIFFS/LittleFS、不含 recorder、不含全量 sniffer。
+
+### 编译与烧录（LILYGO T-2CAN）
+
+```bash
+pio run -e lilygo_t2can_arduino
+pio run -e lilygo_t2can_arduino -t upload --upload-port COMx
+```
+
+WebUI 构建：
+
+```bash
+pio run -e lilygo_t2can_arduino_webui
 ```
 
 ### 16 MB 全量 BIN

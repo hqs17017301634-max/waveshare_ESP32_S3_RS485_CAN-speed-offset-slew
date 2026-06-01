@@ -1,5 +1,7 @@
 # Arduino/RP2040/ESP32 build artifacts
 build/
+.pio/
+*.ino.cpp
 *.elf
 *.bin
 *.uf2
