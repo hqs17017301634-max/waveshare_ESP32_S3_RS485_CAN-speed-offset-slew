@@ -150,6 +150,8 @@ struct RuntimeConfig {
   bool canbFilterEnabled = false;     // OFF = all standard frames; ON = feature IDs only
   bool highBeamStrobeEnabled = false; // arms double-pull flash-to-pass trigger
   bool rearFogBrakeStrobeEnabled = false; // arms brake-triggered 0x273 rear fog burst
+  bool reverseStrobeEnabled = false;  // arms reverse-gear hazard + rear-fog burst
+  bool batteryPreheatEnabled = false; // sends UI_tripPlanning 0x082 every 500 ms
 };
 
 static RuntimeConfig g_config;
@@ -169,6 +171,9 @@ struct RuntimeStatus {
   uint8_t highBeamStrobeRemaining = 0;
   uint8_t rearFogBrakeStrobeActive = 0;
   uint8_t rearFogBrakeStrobeRemaining = 0;
+  uint8_t reverseStrobeActive = 0;
+  uint8_t reverseStrobeRemaining = 0;
+  uint8_t batteryPreheatActive = 0;
 
   int fusedLimitKph = 0;
   int targetSpeedKph = 0;
@@ -301,9 +306,11 @@ static inline void recordCanFrame(const can_frame&, char, uint8_t) {}
 // ---- TWAI helpers ----
 
 static bool twaiRecoveryInProgress = false;
+static uint32_t batteryPreheatLastSendMs = 0;
 
 static bool isRelevantCanId(uint32_t canId);
 static void serviceTwaiAlerts();
+static void serviceBatteryPreheat(const RuntimeConfig& cfg);
 
 static bool twai_send(const can_frame& frame) {
   if (frame.can_dlc > 8) return false;
@@ -407,6 +414,7 @@ static void serviceTwaiAlerts() {
 
 constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
 constexpr uint32_t CAN_ID_AP_CONTROL = 1021;
+constexpr uint32_t CAN_ID_UI_TRIP_PLANNING = 0x082;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
 constexpr uint32_t CAN_ID_BRAKE_PEDAL = 0x145;
 constexpr uint32_t CAN_ID_RCM_INERTIAL2_CH = 0x111;
@@ -429,6 +437,28 @@ static inline bool isRelevantCanId(uint32_t canId) {
          canId == CAN_ID_DAS_STATUS ||
          canId == CAN_ID_FOLLOW_DISTANCE ||
          canId == CAN_ID_AP_CONTROL;
+}
+
+static void serviceBatteryPreheat(const RuntimeConfig& cfg) {
+  if (!cfg.batteryPreheatEnabled) {
+    batteryPreheatLastSendMs = 0;
+    g_status.batteryPreheatActive = 0;
+    return;
+  }
+
+  g_status.batteryPreheatActive = 1;
+  const uint32_t now = millis();
+  if (batteryPreheatLastSendMs != 0 &&
+      (now - batteryPreheatLastSendMs) < 500UL) {
+    return;
+  }
+  batteryPreheatLastSendMs = now;
+
+  can_frame f = {};
+  f.can_id = CAN_ID_UI_TRIP_PLANNING;
+  f.can_dlc = 8;
+  f.data[0] = 0x05;  // tripPlanningActive + requestActiveBatteryHeating
+  twai_send(f);
 }
 
 // CAN A 璋冭瘯瑕佺偣锛?// TWAI 纭欢杩囨护鍙仛鈥滅矖杩囨护鈥濓紝鍑忓皯鎬荤嚎甯ц繘鍏?RX 闃熷垪鐨勬暟閲忥紱
@@ -677,11 +707,14 @@ constexpr uint32_t CANB_ID_LIGHTING_STATUS = 0x3F5;
 constexpr uint8_t HIGH_BEAM_STROBE_PULSES = 8;
 constexpr uint8_t REAR_FOG_PEDAL_STROBE_PULSES = 3;
 constexpr uint8_t REAR_FOG_BODY_STROBE_PULSES = 6;
+constexpr uint8_t REVERSE_STROBE_PULSES = 4;
 constexpr uint8_t REAR_FOG_PRIORITY_PEDAL = 1;
 constexpr uint8_t REAR_FOG_PRIORITY_BODY = 2;
+constexpr uint8_t REAR_FOG_PRIORITY_REVERSE = 3;
 constexpr uint16_t HIGH_BEAM_STROBE_INTERVAL_MS = 75;
 constexpr uint16_t HIGH_BEAM_STROBE_RESEND_MS = 45;
 constexpr uint16_t REAR_FOG_STROBE_INTERVAL_MS = 135;
+constexpr uint16_t REVERSE_STROBE_INTERVAL_MS = 135;
 constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
 constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
 constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
@@ -691,6 +724,8 @@ constexpr float REAR_FOG_VERY_HARD_DECEL_THRESHOLD = -3.50f;
 constexpr uint16_t HIGH_BEAM_DOUBLE_PULL_WINDOW_MS = 1200;
 constexpr uint8_t STALK_STATUS_IDLE = 0;
 constexpr uint8_t STALK_STATUS_PULL = 1;
+constexpr uint8_t STALK_TURN_IDLE = 0;
+constexpr uint8_t STALK_TURN_HAZARD = 6;
 constexpr uint8_t REAR_FOG_MASK = 0x80;
 constexpr uint8_t REAR_FOG_OFF = 0x10;
 constexpr uint8_t REAR_FOG_ON = 0x90;
@@ -730,6 +765,11 @@ static uint32_t rearFogHardDecelStartMs = 0;
 static bool rearFogMildDecelTriggered = false;
 static bool rearFogHardDecelTriggered = false;
 static float rearFogLastVehicleSpeedKph = -1.0f;
+static volatile bool reverseStrobeActive = false;
+static volatile bool reverseStrobeOutputOn = false;
+static volatile uint8_t reverseStrobePulsesRemaining = 0;
+static volatile uint32_t reverseStrobeLastToggleMs = 0;
+static uint8_t lastDIGearRaw = 0;
 
 // CAN B read budget per loop pass 鈥?bounded so it can never starve CAN A.
 constexpr uint8_t CANB_RX_SCAN_LIMIT = 4;
@@ -743,6 +783,7 @@ static void handleCanBFrame(const can_frame& frame);
 static void setCanBServiceMode(bool enabled);
 static void serviceCanBScheduledTx();
 static void serviceHighBeamStrobe(const RuntimeConfig& cfg);
+static void serviceReverseStrobe(const RuntimeConfig& cfg);
 static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg);
 
 static void setupCanB() {
@@ -861,6 +902,28 @@ static can_frame highBeamFrame(uint8_t status) {
   return f;
 }
 
+static can_frame stalkTurnFrame(uint8_t turnStatus) {
+  can_frame f = {};
+  if (canbHasLastStwActnRqFrame) {
+    f = canbLastStwActnRqFrame;
+  } else {
+    f.can_id = CANB_ID_STW_ACTN_RQ;
+    f.can_dlc = 4;
+  }
+  if (f.can_dlc < 4) f.can_dlc = 4;
+  f.can_id = CANB_ID_STW_ACTN_RQ;
+
+  const uint8_t status = STALK_STATUS_IDLE;
+  const uint8_t counter = static_cast<uint8_t>((highBeamStalkLastCounter + 1) & 0x0F);
+  f.data[0] = stalkCrc249(counter, status);
+  f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
+  f.data[2] = static_cast<uint8_t>((f.data[2] & ~0x07) | (turnStatus & 0x07));
+  highBeamStalkLastCounter = counter;
+  canbLastStwActnRqFrame = f;
+  canbHasLastStwActnRqFrame = true;
+  return f;
+}
+
 static uint8_t teslaCanChecksum(uint16_t canId, const uint8_t* data, uint8_t len) {
   uint8_t checksum = static_cast<uint8_t>((canId & 0xFF) + ((canId >> 8) & 0xFF));
   for (uint8_t i = 0; i + 1 < len; ++i) checksum += data[i];
@@ -934,6 +997,30 @@ static void startRearFogBrakeStrobe(uint8_t pulses, uint8_t priority, bool manua
   rearFogBrakeStrobeLastToggleMs = 0;
   g_status.rearFogBrakeStrobeActive = 1;
   g_status.rearFogBrakeStrobeRemaining = pulses;
+}
+
+static void stopReverseStrobe(bool sendOff) {
+  if (sendOff && canbReady) {
+    canb_send(stalkTurnFrame(STALK_TURN_IDLE));
+    canb_send(rearFogFrame(false));
+  }
+  reverseStrobeActive = false;
+  reverseStrobeOutputOn = false;
+  reverseStrobePulsesRemaining = 0;
+  reverseStrobeLastToggleMs = 0;
+  g_status.reverseStrobeActive = 0;
+  g_status.reverseStrobeRemaining = 0;
+}
+
+static void startReverseStrobe() {
+  if (!canbReady) return;
+  reverseStrobeActive = true;
+  reverseStrobeOutputOn = false;
+  reverseStrobePulsesRemaining = REVERSE_STROBE_PULSES;
+  reverseStrobeLastToggleMs = 0;
+  g_status.reverseStrobeActive = 1;
+  g_status.reverseStrobeRemaining = REVERSE_STROBE_PULSES;
+  startRearFogBrakeStrobe(REVERSE_STROBE_PULSES, REAR_FOG_PRIORITY_REVERSE, true);
 }
 
 static bool readBitsLE(const can_frame& frame, uint8_t startBit, uint8_t length, uint32_t& value) {
@@ -1061,6 +1148,45 @@ static void serviceHighBeamStrobe(const RuntimeConfig& cfg) {
   g_status.highBeamStrobeRemaining = highBeamStrobePulsesRemaining;
 }
 
+static void serviceReverseStrobe(const RuntimeConfig& cfg) {
+  if (!canbReady) return;
+  if (!cfg.canbEnabled) {
+    if (reverseStrobeActive || reverseStrobeOutputOn) stopReverseStrobe(false);
+    return;
+  }
+  if (!cfg.reverseStrobeEnabled) {
+    if (reverseStrobeActive || reverseStrobeOutputOn) stopReverseStrobe(true);
+    lastDIGearRaw = 0;
+    return;
+  }
+  if (!reverseStrobeActive) return;
+
+  const uint32_t now = millis();
+  if (reverseStrobeLastToggleMs != 0 &&
+      (now - reverseStrobeLastToggleMs) < REVERSE_STROBE_INTERVAL_MS) {
+    g_status.reverseStrobeActive = 1;
+    g_status.reverseStrobeRemaining = reverseStrobePulsesRemaining;
+    return;
+  }
+  reverseStrobeLastToggleMs = now;
+
+  if (!reverseStrobeOutputOn) {
+    canb_send(stalkTurnFrame(STALK_TURN_HAZARD));
+    reverseStrobeOutputOn = true;
+  } else {
+    canb_send(stalkTurnFrame(STALK_TURN_IDLE));
+    reverseStrobeOutputOn = false;
+    if (reverseStrobePulsesRemaining > 0) reverseStrobePulsesRemaining--;
+    if (reverseStrobePulsesRemaining == 0) {
+      stopReverseStrobe(true);
+      return;
+    }
+  }
+
+  g_status.reverseStrobeActive = 1;
+  g_status.reverseStrobeRemaining = reverseStrobePulsesRemaining;
+}
+
 static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg) {
   if (!canbReady) return;
   // 0x273 鍚庨浘鐏垎闂細韪╁埞杞﹀彧璐熻矗瑙﹀彂锛屽疄闄呰緭鍑哄浐瀹?6 涓?ON/OFF 鑴夊啿銆?  if (!canbReady) return;
@@ -1157,6 +1283,12 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
   }
 
   if (frame.can_id == CAN_ID_DI_SYSTEM_STATUS && frame.can_dlc >= 8) {
+    const uint8_t gearRaw = static_cast<uint8_t>((frame.data[2] >> 5) & 0x07);
+    if (cfg.reverseStrobeEnabled && gearRaw == 2 && lastDIGearRaw != 2) {
+      startReverseStrobe();
+    }
+    lastDIGearRaw = gearRaw;
+
     uint32_t raw = 0;
     if (readBitsLE(frame, 51, 1, raw) && raw != 0) {
       rearFogRecentRegenUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
@@ -1353,6 +1485,8 @@ static void handleStatus() {
 #endif
   j += ",\"highBeamStrobeEnabled\":"; j += c.highBeamStrobeEnabled ? 1 : 0;
   j += ",\"rearFogBrakeStrobeEnabled\":"; j += c.rearFogBrakeStrobeEnabled ? 1 : 0;
+  j += ",\"reverseStrobeEnabled\":"; j += c.reverseStrobeEnabled ? 1 : 0;
+  j += ",\"batteryPreheatEnabled\":"; j += c.batteryPreheatEnabled ? 1 : 0;
   j += ",\"can1Rx\":";               j += s.can1Rx;
   j += ",\"can1Tx\":";               j += s.can1Tx;
   j += ",\"can1TxFail\":";           j += s.can1TxFail;
@@ -1365,6 +1499,9 @@ static void handleStatus() {
   j += ",\"highBeamStrobeRemaining\":"; j += s.highBeamStrobeRemaining;
   j += ",\"rearFogBrakeStrobeActive\":"; j += s.rearFogBrakeStrobeActive;
   j += ",\"rearFogBrakeStrobeRemaining\":"; j += s.rearFogBrakeStrobeRemaining;
+  j += ",\"reverseStrobeActive\":"; j += s.reverseStrobeActive;
+  j += ",\"reverseStrobeRemaining\":"; j += s.reverseStrobeRemaining;
+  j += ",\"batteryPreheatActive\":"; j += s.batteryPreheatActive;
   j += ",\"fusedLimitKph\":";        j += s.fusedLimitKph;
   j += ",\"targetSpeedKph\":";       j += s.targetSpeedKph;
   j += ",\"offsetKph\":";            j += s.offsetKph;
@@ -1408,6 +1545,8 @@ static void handleConfig() {
   c.canbFilterEnabled       = argBool("canbFilterEnabled", c.canbFilterEnabled);
   c.highBeamStrobeEnabled   = argBool("highBeamStrobeEnabled", c.highBeamStrobeEnabled);
   c.rearFogBrakeStrobeEnabled = argBool("rearFogBrakeStrobeEnabled", c.rearFogBrakeStrobeEnabled);
+  c.reverseStrobeEnabled    = argBool("reverseStrobeEnabled", c.reverseStrobeEnabled);
+  c.batteryPreheatEnabled   = argBool("batteryPreheatEnabled", c.batteryPreheatEnabled);
 
   const bool newServiceMode = argBool("canbServiceModeEnabled", c.canbServiceModeEnabled);
   const bool serviceModeChanged = (newServiceMode != c.canbServiceModeEnabled);
@@ -1641,6 +1780,8 @@ static void loadConfigFromPrefs() {
   c.canbFilterEnabled      = prefs.getBool("canbFilt", c.canbFilterEnabled);
   c.highBeamStrobeEnabled  = prefs.getBool("hbStrobe", c.highBeamStrobeEnabled);
   c.rearFogBrakeStrobeEnabled = prefs.getBool("fogBrake", c.rearFogBrakeStrobeEnabled);
+  c.reverseStrobeEnabled   = prefs.getBool("revStrobe", c.reverseStrobeEnabled);
+  c.batteryPreheatEnabled  = prefs.getBool("batHeat", c.batteryPreheatEnabled);
   prefs.end();
 
   portENTER_CRITICAL(&g_cfgMux);
@@ -1667,6 +1808,8 @@ static void saveConfigToPrefs() {
   prefs.putBool("canbFilt", c.canbFilterEnabled);
   prefs.putBool("hbStrobe", c.highBeamStrobeEnabled);
   prefs.putBool("fogBrake", c.rearFogBrakeStrobeEnabled);
+  prefs.putBool("revStrobe", c.reverseStrobeEnabled);
+  prefs.putBool("batHeat", c.batteryPreheatEnabled);
   prefs.end();
 }
 
@@ -1766,12 +1909,16 @@ void loop() {
     drainCanBWithBudget();
     serviceCanBScheduledTx();
     serviceHighBeamStrobe(canbCfg);
+    serviceReverseStrobe(canbCfg);
     serviceRearFogBrakeStrobe(canbCfg);
   } else {
     serviceHighBeamStrobe(canbCfg);
+    serviceReverseStrobe(canbCfg);
     serviceRearFogBrakeStrobe(canbCfg);
   }
 #endif
+
+  serviceBatteryPreheat(configSnapshot());
 
   if (!didWork) {
     digitalWrite(PIN_LED, HIGH);

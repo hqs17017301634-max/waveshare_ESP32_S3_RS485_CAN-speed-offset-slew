@@ -52,13 +52,17 @@ button.alt{background:#37c}button.warn{background:#a33}
 <button class="alt" onclick="testCanB('strobe')">测试 0x249 高光爆闪</button>
 <button class="alt" onclick="testCanB('fog')">测试 0x273 后雾灯</button>
 </div>
+<label>倒挡双闪雾灯启用<input type="checkbox" id="reverseStrobeEnabled"></label>
+<p class="hint">倒挡双闪雾灯：CAN A 0x118 识别 DI_gear=R，上升沿触发双闪 + 后雾灯 4 次；双闪 0x249 转向字段需实车验证。</p>
+<label>电池预热启用<input type="checkbox" id="batteryPreheatEnabled"></label>
+<p class="hint">电池预热：开启后 CAN A 每 500ms 发送 0x082 UI_tripPlanning，DLC=8，data[0]=0x05；关闭后停止发送。</p>
 <div class="result" id="testResult"></div>
 </div>
 
 <div class="card">
 <h2>CAN 抓包</h2>
 <p class="hint">默认抓取 CAN A/B 灯光与 FSD 相关上下文。清空输入框可抓取全部帧。下载 CSV 前请先停止抓包。</p>
-<input type="text" id="recIds" value="111,116,118,145,148,185,186,257,273,249,3F5">
+<input type="text" id="recIds" value="082,111,116,118,145,148,185,186,257,273,249,3F5">
 <div>
 <button onclick="startRec()">开始抓包</button>
 <button class="warn" onclick="stopRec()">停止</button>
@@ -90,12 +94,15 @@ button.alt{background:#37c}button.warn{background:#a33}
 <div class="kv"><span>后雾灯爆闪中</span><span id="rearFogBrakeStrobeActive">-</span></div>
 <div class="kv"><span>后雾灯剩余次数</span><span id="rearFogBrakeStrobeRemaining">-</span></div>
 <div class="kv"><span>运行时间 秒</span><span id="uptime">-</span></div>
+<div class="kv"><span>倒挡双闪雾灯中</span><span id="reverseStrobeActive">-</span></div>
+<div class="kv"><span>倒挡剩余次数</span><span id="reverseStrobeRemaining">-</span></div>
+<div class="kv"><span>电池预热发送中</span><span id="batteryPreheatActive">-</span></div>
 </div>
 
 <script>
 let pollTimer=null,recTimer=null,loaded=false;
-const ids=["fsdEnabled","autoSpeedOffsetEnabled","slewPctPerSec","lowSpeedMaxPctRaw","targetBelow60","target60","target70","target80","target90","target100","target120","canbEnabled","canbServiceModeEnabled","canbFilterEnabled","highBeamStrobeEnabled","rearFogBrakeStrobeEnabled"];
-const stats=["can1Rx","can1Tx","can1TxFail","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterEnabled","canbRx","canbTx","canbTxFail","canbLastId","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","uptime"];
+const ids=["fsdEnabled","autoSpeedOffsetEnabled","slewPctPerSec","lowSpeedMaxPctRaw","targetBelow60","target60","target70","target80","target90","target100","target120","canbEnabled","canbServiceModeEnabled","canbFilterEnabled","highBeamStrobeEnabled","rearFogBrakeStrobeEnabled","reverseStrobeEnabled","batteryPreheatEnabled"];
+const stats=["can1Rx","can1Tx","can1TxFail","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterEnabled","canbRx","canbTx","canbTxFail","canbLastId","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","reverseStrobeActive","reverseStrobeRemaining","batteryPreheatActive","uptime"];
 function setVal(id,v){const e=document.getElementById(id);if(!e)return;if(e.type==="checkbox")e.checked=!!v;else e.value=v;}
 function showResult(text){const e=document.getElementById("testResult");if(e)e.textContent=text;}
 function pollStatus(){
