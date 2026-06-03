@@ -201,6 +201,22 @@ static inline RuntimeConfig configSnapshot() {
 #endif
 }
 
+static inline void applyBuildModeGuards(RuntimeConfig& c) {
+#ifdef ENABLE_CANA_FULL_RECORDER
+  c.fsdEnabled = false;
+  c.autoSpeedOffsetEnabled = false;
+  c.canbEnabled = false;
+  c.canbServiceModeEnabled = false;
+  c.canbFilterEnabled = false;
+  c.highBeamStrobeEnabled = false;
+  c.rearFogBrakeStrobeEnabled = false;
+  c.reverseStrobeEnabled = false;
+  c.batteryPreheatEnabled = false;
+#else
+  (void)c;
+#endif
+}
+
 #ifdef ENABLE_LIGHT_WEBUI
 #ifndef REC_CAP
 #define REC_CAP 4000
@@ -346,9 +362,12 @@ static bool twai_recv(can_frame& frame) {
   for (uint8_t i = 0; i < TWAI_RX_SCAN_LIMIT; ++i) {
     TickType_t waitTicks = (i == 0) ? pdMS_TO_TICKS(TWAI_RX_WAIT_MS) : 0;
     if (twai_receive(&msg, waitTicks) != ESP_OK) return false;
-    if (msg.extd || msg.rtr || msg.data_length_code > 8 || !isRelevantCanId(msg.identifier)) {
+    if (msg.extd || msg.rtr || msg.data_length_code > 8) {
       continue;
     }
+#ifndef ENABLE_CANA_FULL_RECORDER
+    if (!isRelevantCanId(msg.identifier)) continue;
+#endif
 
     frame.can_id  = msg.identifier;
     frame.can_dlc = msg.data_length_code;
@@ -1629,6 +1648,7 @@ static void handleConfig() {
   const bool newServiceMode = argBool("canbServiceModeEnabled", c.canbServiceModeEnabled);
   const bool serviceModeChanged = (newServiceMode != c.canbServiceModeEnabled);
   c.canbServiceModeEnabled  = newServiceMode;
+  applyBuildModeGuards(c);
 
   portENTER_CRITICAL(&g_cfgMux);
   g_config = c;
@@ -1861,6 +1881,7 @@ static void loadConfigFromPrefs() {
   c.reverseStrobeEnabled   = prefs.getBool("revStrobe", c.reverseStrobeEnabled);
   c.batteryPreheatEnabled  = prefs.getBool("batHeat", c.batteryPreheatEnabled);
   prefs.end();
+  applyBuildModeGuards(c);
 
   portENTER_CRITICAL(&g_cfgMux);
   g_config = c;
@@ -1974,6 +1995,17 @@ void loop() {
   bool didWork = false;
 
   can_frame frame;
+#ifdef ENABLE_CANA_FULL_RECORDER
+#ifndef CANA_FULL_RECORDER_RX_BUDGET
+#define CANA_FULL_RECORDER_RX_BUDGET 120
+#endif
+  uint16_t canaBudget = CANA_FULL_RECORDER_RX_BUDGET;
+  while (canaBudget-- > 0 && twai_recv(frame)) {
+    didWork = true;
+    digitalWrite(PIN_LED, LOW);
+    recordCanFrame(frame, 'R', 1);
+  }
+#else
   if (twai_recv(frame)) {
     didWork = true;
     digitalWrite(PIN_LED, LOW);
@@ -1983,6 +2015,7 @@ void loop() {
     handler.refreshUnifiedSpeedCompensation(cfg);
     handler.handelMessage(frame, cfg);
   }
+#endif
 
 #ifdef ENABLE_CANB_MCP2515
   RuntimeConfig canbCfg = configSnapshot();

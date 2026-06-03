@@ -62,7 +62,7 @@ button.alt{background:#37c}button.warn{background:#a33}
 <div class="card">
 <h2>CAN 抓包</h2>
 <p class="hint">默认抓取 CAN A/B 灯光与 FSD 相关上下文。清空输入框可抓取全部帧。下载 CSV 前请先停止抓包。</p>
-<input type="text" id="recIds" value="082,111,116,118,145,148,185,186,257,273,249,3F5">
+<input type="text" id="recIds" value="">
 <div>
 <button onclick="startRec()">开始抓包</button>
 <button class="warn" onclick="stopRec()">停止</button>
