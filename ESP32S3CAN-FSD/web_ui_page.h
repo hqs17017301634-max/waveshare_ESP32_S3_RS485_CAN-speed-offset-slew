@@ -42,7 +42,7 @@ button.alt{background:#37c}button.warn{background:#a33}
 <label>高光爆闪启用<input type="checkbox" id="highBeamStrobeEnabled"></label>
 <label>后雾灯刹车爆闪启用<input type="checkbox" id="rearFogBrakeStrobeEnabled"></label>
 <p class="hint">高光爆闪：CAN B 0x249，超车灯拨杆下拉两次触发 8 次；输出 status=1 PULL / status=0 idle，75ms 开 / 75ms 关。</p>
-<p class="hint">后雾灯爆闪：CAN A 0x145 踏板触发 3 次；CAN B 0x273 车身灯光刹车状态触发 6 次。</p>
+<p class="hint">后雾灯爆闪：缓减速触发 3 次，急减速触发 6 次；0x145/0x273/0x148/0x185 作为刹车与制动确认。</p>
 <div>
 <button onclick="applyConfig()">应用到内存</button>
 <button class="alt" onclick="saveConfig()">保存到 Flash</button>
@@ -58,7 +58,7 @@ button.alt{background:#37c}button.warn{background:#a33}
 <div class="card">
 <h2>CAN 抓包</h2>
 <p class="hint">默认抓取 CAN A/B 灯光与 FSD 相关上下文。清空输入框可抓取全部帧。下载 CSV 前请先停止抓包。</p>
-<input type="text" id="recIds" value="249,273,3F5,145,399,3F8,3FD">
+<input type="text" id="recIds" value="111,116,118,145,148,185,186,257,273,249,3F5">
 <div>
 <button onclick="startRec()">开始抓包</button>
 <button class="warn" onclick="stopRec()">停止</button>

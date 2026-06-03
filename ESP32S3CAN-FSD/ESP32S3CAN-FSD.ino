@@ -409,9 +409,23 @@ constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
 constexpr uint32_t CAN_ID_AP_CONTROL = 1021;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
 constexpr uint32_t CAN_ID_BRAKE_PEDAL = 0x145;
+constexpr uint32_t CAN_ID_RCM_INERTIAL2_CH = 0x111;
+constexpr uint32_t CAN_ID_RCM_INERTIAL2_ETH = 0x116;
+constexpr uint32_t CAN_ID_DI_SYSTEM_STATUS = 0x118;
+constexpr uint32_t CAN_ID_DI_CHASSIS_CONTROL = 0x148;
+constexpr uint32_t CAN_ID_ESP_BRAKE_TORQUE = 0x185;
+constexpr uint32_t CAN_ID_DIF_TORQUE = 0x186;
+constexpr uint32_t CAN_ID_VEHICLE_SPEED = 0x257;
 
 static inline bool isRelevantCanId(uint32_t canId) {
   return canId == CAN_ID_BRAKE_PEDAL ||
+         canId == CAN_ID_RCM_INERTIAL2_CH ||
+         canId == CAN_ID_RCM_INERTIAL2_ETH ||
+         canId == CAN_ID_DI_SYSTEM_STATUS ||
+         canId == CAN_ID_DI_CHASSIS_CONTROL ||
+         canId == CAN_ID_ESP_BRAKE_TORQUE ||
+         canId == CAN_ID_DIF_TORQUE ||
+         canId == CAN_ID_VEHICLE_SPEED ||
          canId == CAN_ID_DAS_STATUS ||
          canId == CAN_ID_FOLLOW_DISTANCE ||
          canId == CAN_ID_AP_CONTROL;
@@ -425,8 +439,8 @@ static inline bool isRelevantCanId(uint32_t canId) {
 // Adding 0x145 widens this coarse filter; software filtering above still drops
 // every unrelated ID. Standard 11-bit IDs sit in bits [31:21];
 // in twai_filter_config_t a mask bit of 1 means "don't care".
-constexpr uint32_t CAN_ACCEPT_CODE = static_cast<uint32_t>(0x100) << 21;
-constexpr uint32_t CAN_ACCEPT_MASK = ~(static_cast<uint32_t>(0x502) << 21);
+constexpr uint32_t CAN_ACCEPT_CODE = 0;
+constexpr uint32_t CAN_ACCEPT_MASK = 0xFFFFFFFF;
 
 // ---- Unified speed compensation ----
 
@@ -464,6 +478,8 @@ SpeedLimitMonitor speedLimitMonitor;
 
 #ifdef ENABLE_CANB_MCP2515
 static void handleRearFogPedalBrakeEdge(bool brakeActive, const RuntimeConfig& cfg);
+static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& cfg);
+static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg);
 #endif
 
 // ---- Bit-level helpers ----
@@ -579,13 +595,11 @@ struct HW3Handler {
   }
 
   void handelMessage(can_frame& frame, const RuntimeConfig& cfg) {
+#ifdef ENABLE_CANB_MCP2515
+    handleRearFogCanADecelFrame(frame, cfg);
+#endif
     if (frame.can_id == CAN_ID_BRAKE_PEDAL) {
       if (frame.can_dlc < 4) return;
-      const uint8_t brakeVal = static_cast<uint8_t>((frame.data[3] >> 5) & 0x03);
-#ifdef ENABLE_CANB_MCP2515
-      handleRearFogPedalBrakeEdge(brakeVal != 0, cfg);
-      // 0x145 韪忔澘瑙﹀彂婧愶細鐪熷疄鍒硅溅韪忔澘涓婂崌娌匡紝瑙﹀彂杈冨厠鍒剁殑 3 娆″悗闆剧伅闂儊銆?      handleRearFogPedalBrakeEdge(brakeVal != 0, cfg);
-#endif
       return;
     }
 
@@ -668,6 +682,12 @@ constexpr uint8_t REAR_FOG_PRIORITY_BODY = 2;
 constexpr uint16_t HIGH_BEAM_STROBE_INTERVAL_MS = 75;
 constexpr uint16_t HIGH_BEAM_STROBE_RESEND_MS = 45;
 constexpr uint16_t REAR_FOG_STROBE_INTERVAL_MS = 135;
+constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
+constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
+constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
+constexpr float REAR_FOG_MILD_DECEL_THRESHOLD = -0.80f;
+constexpr float REAR_FOG_HARD_DECEL_THRESHOLD = -2.50f;
+constexpr float REAR_FOG_VERY_HARD_DECEL_THRESHOLD = -3.50f;
 constexpr uint16_t HIGH_BEAM_DOUBLE_PULL_WINDOW_MS = 1200;
 constexpr uint8_t STALK_STATUS_IDLE = 0;
 constexpr uint8_t STALK_STATUS_PULL = 1;
@@ -699,6 +719,17 @@ static volatile uint8_t rearFogBrakeStrobePriority = 0;
 static volatile uint32_t rearFogBrakeStrobeLastToggleMs = 0;
 static bool rearFogLastPedalBrakeActive = false;
 static bool rearFogLastBrakeActive = false;
+static uint32_t rearFogRecentPedalBrakeUntilMs = 0;
+static uint32_t rearFogRecentBrakeLampUntilMs = 0;
+static uint32_t rearFogRecentBrakeTorqueUntilMs = 0;
+static uint32_t rearFogRecentRegenUntilMs = 0;
+static uint32_t rearFogRecentNegTorqueUntilMs = 0;
+static uint32_t rearFogRecentSpeedFallingUntilMs = 0;
+static uint32_t rearFogMildDecelStartMs = 0;
+static uint32_t rearFogHardDecelStartMs = 0;
+static bool rearFogMildDecelTriggered = false;
+static bool rearFogHardDecelTriggered = false;
+static float rearFogLastVehicleSpeedKph = -1.0f;
 
 // CAN B read budget per loop pass 鈥?bounded so it can never starve CAN A.
 constexpr uint8_t CANB_RX_SCAN_LIMIT = 4;
@@ -905,6 +936,82 @@ static void startRearFogBrakeStrobe(uint8_t pulses, uint8_t priority, bool manua
   g_status.rearFogBrakeStrobeRemaining = pulses;
 }
 
+static bool readBitsLE(const can_frame& frame, uint8_t startBit, uint8_t length, uint32_t& value) {
+  if (length == 0 || length > 32) return false;
+  if (static_cast<uint16_t>(startBit) + length > static_cast<uint16_t>(frame.can_dlc) * 8U) return false;
+  uint32_t raw = 0;
+  for (uint8_t i = 0; i < length; ++i) {
+    const uint8_t bit = static_cast<uint8_t>(startBit + i);
+    if ((frame.data[bit / 8] >> (bit % 8)) & 0x01) {
+      raw |= (1UL << i);
+    }
+  }
+  value = raw;
+  return true;
+}
+
+static bool readSignedBitsLE(const can_frame& frame, uint8_t startBit, uint8_t length, int32_t& value) {
+  uint32_t raw = 0;
+  if (!readBitsLE(frame, startBit, length, raw)) return false;
+  if (length < 32 && (raw & (1UL << (length - 1)))) {
+    raw |= (~0UL << length);
+  }
+  value = static_cast<int32_t>(raw);
+  return true;
+}
+
+static void handleRearFogDecelAccel(float accel, const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+  if (!canbReady || !cfg.canbEnabled || !cfg.rearFogBrakeStrobeEnabled) {
+    rearFogMildDecelStartMs = 0;
+    rearFogHardDecelStartMs = 0;
+    rearFogMildDecelTriggered = false;
+    rearFogHardDecelTriggered = false;
+    return;
+  }
+
+  const bool recentPedalBrake = now < rearFogRecentPedalBrakeUntilMs;
+  const bool recentBrakeLamp = now < rearFogRecentBrakeLampUntilMs;
+  const bool recentBrakeTorque = now < rearFogRecentBrakeTorqueUntilMs;
+  const bool recentRegen = now < rearFogRecentRegenUntilMs;
+  const bool recentNegTorque = now < rearFogRecentNegTorqueUntilMs;
+  const bool recentSpeedFalling = now < rearFogRecentSpeedFallingUntilMs;
+
+  const bool hardAux = recentBrakeLamp || recentBrakeTorque || recentPedalBrake;
+  const bool mildAux = hardAux || recentRegen || recentNegTorque || recentSpeedFalling;
+  const bool hardCandidate =
+    (accel <= REAR_FOG_HARD_DECEL_THRESHOLD && hardAux) ||
+    (accel <= REAR_FOG_VERY_HARD_DECEL_THRESHOLD);
+  const bool mildCandidate =
+    !hardCandidate && accel <= REAR_FOG_MILD_DECEL_THRESHOLD && mildAux;
+
+  if (!hardCandidate) {
+    rearFogHardDecelStartMs = 0;
+    rearFogHardDecelTriggered = false;
+  } else {
+    if (rearFogHardDecelStartMs == 0) rearFogHardDecelStartMs = now;
+    if (!rearFogHardDecelTriggered &&
+        (now - rearFogHardDecelStartMs) >= REAR_FOG_HARD_DECEL_HOLD_MS) {
+      startRearFogBrakeStrobe(REAR_FOG_BODY_STROBE_PULSES, REAR_FOG_PRIORITY_BODY);
+      rearFogHardDecelTriggered = true;
+      rearFogMildDecelTriggered = true;
+    }
+  }
+
+  if (!mildCandidate || hardCandidate) {
+    rearFogMildDecelStartMs = 0;
+    if (!mildCandidate) rearFogMildDecelTriggered = false;
+    return;
+  }
+
+  if (rearFogMildDecelStartMs == 0) rearFogMildDecelStartMs = now;
+  if (!rearFogMildDecelTriggered &&
+      (now - rearFogMildDecelStartMs) >= REAR_FOG_MILD_DECEL_HOLD_MS) {
+    startRearFogBrakeStrobe(REAR_FOG_PEDAL_STROBE_PULSES, REAR_FOG_PRIORITY_PEDAL);
+    rearFogMildDecelTriggered = true;
+  }
+}
+
 static void serviceHighBeamStrobe(const RuntimeConfig& cfg) {
   if (!canbReady) return;
   // 0x249 high-light strobe: alternate PULL(status=1) and idle(status=0).
@@ -998,21 +1105,116 @@ static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg) {
 }
 
 static void handleRearFogPedalBrakeEdge(bool brakeActive, const RuntimeConfig& cfg) {
-  if (!canbReady || !cfg.canbEnabled) {
-    rearFogLastPedalBrakeActive = brakeActive;
-    return;
-  }
-
-  if (!cfg.rearFogBrakeStrobeEnabled) {
-    rearFogLastPedalBrakeActive = brakeActive;
-    return;
-  }
-
-  if (brakeActive && !rearFogLastPedalBrakeActive) {
-    startRearFogBrakeStrobe(REAR_FOG_PEDAL_STROBE_PULSES, REAR_FOG_PRIORITY_PEDAL);
+  (void)cfg;
+  const uint32_t now = millis();
+  if (brakeActive) {
+    rearFogRecentPedalBrakeUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
   }
   rearFogLastPedalBrakeActive = brakeActive;
 }
+
+static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& cfg) {
+  (void)cfg;
+  const uint32_t now = millis();
+  if (brakeActive) {
+    rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+  }
+  rearFogLastBrakeActive = brakeActive;
+}
+
+static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+
+  if (frame.can_id == CAN_ID_BRAKE_PEDAL && frame.can_dlc >= 8) {
+    uint32_t raw = 0;
+    const bool brakeLamp = readBitsLE(frame, 21, 1, raw) && raw != 0;
+    const bool driverBrake =
+      readBitsLE(frame, 29, 2, raw) && raw == 2;
+    const bool brakeApply =
+      readBitsLE(frame, 31, 1, raw) && raw != 0;
+    const bool brakeTorque =
+      readBitsLE(frame, 51, 13, raw) && raw > 0;
+    handleRearFogPedalBrakeEdge(driverBrake || brakeApply, cfg);
+    if (brakeLamp) rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    if (brakeTorque) rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    return;
+  }
+
+  if ((frame.can_id == CAN_ID_RCM_INERTIAL2_CH || frame.can_id == CAN_ID_RCM_INERTIAL2_ETH) &&
+      frame.can_dlc >= 6) {
+    int32_t rawAccel = 0;
+    if (readSignedBitsLE(frame, 0, 16, rawAccel) && rawAccel != -32768) {
+      bool qfOk = true;
+      uint32_t qf = 1;
+      if (frame.can_id == CAN_ID_RCM_INERTIAL2_CH && frame.can_dlc >= 7) {
+        qfOk = readBitsLE(frame, 48, 1, qf) && qf != 0;
+      }
+      if (qfOk) {
+        handleRearFogDecelAccel(static_cast<float>(rawAccel) * 0.00125f, cfg);
+      }
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DI_SYSTEM_STATUS && frame.can_dlc >= 8) {
+    uint32_t raw = 0;
+    if (readBitsLE(frame, 51, 1, raw) && raw != 0) {
+      rearFogRecentRegenUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    int32_t accelRaw = 0;
+    if (readSignedBitsLE(frame, 52, 12, accelRaw) && accelRaw != -2048) {
+      handleRearFogDecelAccel(static_cast<float>(accelRaw) * 0.01f, cfg);
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DI_CHASSIS_CONTROL && frame.can_dlc >= 4) {
+    uint32_t raw = 0;
+    if (readBitsLE(frame, 15, 1, raw) && raw != 0) {
+      rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_ESP_BRAKE_TORQUE && frame.can_dlc >= 7) {
+    uint32_t qf = 0;
+    uint32_t frL = 0, frR = 0, reL = 0, reR = 0;
+    if (readBitsLE(frame, 50, 1, qf) && qf != 0 &&
+        readBitsLE(frame, 0, 12, frL) &&
+        readBitsLE(frame, 12, 12, frR) &&
+        readBitsLE(frame, 24, 12, reL) &&
+        readBitsLE(frame, 36, 12, reR) &&
+        (frL + frR + reL + reR) > 0) {
+      rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DIF_TORQUE && frame.can_dlc >= 8) {
+    int32_t torqueActualRaw = 0;
+    uint32_t qf = 0;
+    if (readSignedBitsLE(frame, 27, 13, torqueActualRaw) &&
+        readBitsLE(frame, 56, 2, qf) && qf == 1 &&
+        torqueActualRaw < 0) {
+      rearFogRecentNegTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_VEHICLE_SPEED && frame.can_dlc >= 4) {
+    const uint16_t rawSpeed =
+      static_cast<uint16_t>((static_cast<uint16_t>(frame.data[2]) << 4) | (frame.data[1] >> 4));
+    float speedKph = static_cast<float>(rawSpeed) * 0.08f - 40.0f;
+    if (speedKph < 0.0f) speedKph = 0.0f;
+    if (rearFogLastVehicleSpeedKph >= 0.0f &&
+        speedKph + 0.5f < rearFogLastVehicleSpeedKph) {
+      rearFogRecentSpeedFallingUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    rearFogLastVehicleSpeedKph = speedKph;
+    return;
+  }
+}
+
 static void handleCanBFrame(const can_frame& frame) {
   // Stage 1: statistics only. No heavy work, no Serial, no JSON, no bridging.
   canbLastId = frame.can_id;
@@ -1050,15 +1252,7 @@ static void handleCanBFrame(const can_frame& frame) {
 
     const RuntimeConfig cfg = configSnapshot();
     const bool brakeActive = (frame.data[7] & 0x01) != 0;
-
-    if (!cfg.rearFogBrakeStrobeEnabled) {
-      rearFogLastBrakeActive = brakeActive;
-    } else if (brakeActive && !rearFogLastBrakeActive && !rearFogBrakeStrobeActive) {
-      startRearFogBrakeStrobe(REAR_FOG_BODY_STROBE_PULSES, REAR_FOG_PRIORITY_BODY);
-    } else if (brakeActive && !rearFogLastBrakeActive) {
-      startRearFogBrakeStrobe(REAR_FOG_BODY_STROBE_PULSES, REAR_FOG_PRIORITY_BODY);
-    }
-    rearFogLastBrakeActive = brakeActive;
+    handleRearFogBrakeLampState(brakeActive, cfg);
   }
 }
 
@@ -1381,8 +1575,28 @@ static void handleRecDownload() {
   server.sendHeader("Content-Disposition", "attachment; filename=\"can_recording.csv\"");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  WiFiClient client = server.client();
-  client.print("ts_ms,dir,bus,id,dlc,b0,b1,b2,b3,b4,b5,b6,b7\n");
+  char chunk[1024];
+  size_t used = 0;
+  auto flushChunk = [&]() {
+    if (used == 0) return;
+    server.sendContent(chunk, used);
+    used = 0;
+    yield();
+  };
+  auto appendChunk = [&](const char* text, size_t len) {
+    while (len > 0) {
+      const size_t room = sizeof(chunk) - used;
+      if (room == 0) flushChunk();
+      const size_t take = std::min(len, sizeof(chunk) - used);
+      memcpy(chunk + used, text, take);
+      used += take;
+      text += take;
+      len -= take;
+    }
+  };
+
+  static const char header[] = "ts_ms,dir,bus,id,dlc,b0,b1,b2,b3,b4,b5,b6,b7\n";
+  appendChunk(header, sizeof(header) - 1);
   char line[96];
   for (uint32_t i = 0; i < n; ++i) {
     const RecFrame& r = recBuf[i];
@@ -1401,9 +1615,11 @@ static void handleRecDownload() {
              static_cast<unsigned>(r.data[5]),
              static_cast<unsigned>(r.data[6]),
              static_cast<unsigned>(r.data[7]));
-    client.print(line);
-    if ((i & 0x3F) == 0) yield();
+    appendChunk(line, strlen(line));
+    if ((i & 0x3F) == 0) flushChunk();
   }
+  flushChunk();
+  server.sendContent("");
 }
 
 static void loadConfigFromPrefs() {
