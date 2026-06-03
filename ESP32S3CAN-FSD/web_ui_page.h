@@ -53,9 +53,9 @@ button.alt{background:#37c}button.warn{background:#a33}
 <button class="alt" onclick="testCanB('fog')">测试 0x273 后雾灯</button>
 </div>
 <label>倒挡双闪雾灯启用<input type="checkbox" id="reverseStrobeEnabled"></label>
-<p class="hint">倒挡双闪雾灯：CAN A 0x118 识别 DI_gear=R，上升沿触发双闪 + 后雾灯 4 次；双闪 0x249 转向字段需实车验证。</p>
+<p class="hint">倒挡双闪雾灯：CAN A 0x118 识别 DI_gear=R，或 踩刹车+右滚轮向后(0x3C2 rightScrollTicks&lt;0)，触发双闪(0x3C2 hazard 按钮 byte0 bit3)+后雾灯 4 次；双闪按钮帧需实车验证。</p>
 <label>电池预热启用<input type="checkbox" id="batteryPreheatEnabled"></label>
-<p class="hint">电池预热：开启后 CAN A 每 500ms 发送 0x082 UI_tripPlanning，DLC=8，data[0]=0x05；关闭后停止发送。</p>
+<p class="hint">电池预热：开启后 CAN A 每 1000ms 发送 0x082 UI_tripPlanning ON 帧(AF 50 AC 3C FF 03 9A 0F)；关闭后补发数帧 OFF(01 50 AC 3C FF 03 9A 0F)。</p>
 <div class="result" id="testResult"></div>
 </div>
 

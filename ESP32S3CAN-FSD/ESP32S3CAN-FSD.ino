@@ -439,26 +439,49 @@ static inline bool isRelevantCanId(uint32_t canId) {
          canId == CAN_ID_AP_CONTROL;
 }
 
+// Battery-preheat 0x082 UI_tripPlanning payloads — from on-vehicle capture.
+// ON  = AF 50 AC 3C FF 03 9A 0F   (preheat requested, ~1000 ms period)
+// OFF = 01 50 AC 3C FF 03 9A 0F   (request cleared)
+static const uint8_t BATTERY_PREHEAT_ON[8]  = {0xAF, 0x50, 0xAC, 0x3C, 0xFF, 0x03, 0x9A, 0x0F};
+static const uint8_t BATTERY_PREHEAT_OFF[8] = {0x01, 0x50, 0xAC, 0x3C, 0xFF, 0x03, 0x9A, 0x0F};
+constexpr uint32_t BATTERY_PREHEAT_PERIOD_MS = 1000UL;
+static uint8_t batteryPreheatOffFramesLeft = 0;
+
+static void sendBatteryPreheatFrame(const uint8_t payload[8]) {
+  can_frame f = {};
+  f.can_id = CAN_ID_UI_TRIP_PLANNING;
+  f.can_dlc = 8;
+  memcpy(f.data, payload, 8);
+  twai_send(f);
+}
+
 static void serviceBatteryPreheat(const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+
   if (!cfg.batteryPreheatEnabled) {
-    batteryPreheatLastSendMs = 0;
     g_status.batteryPreheatActive = 0;
+    // On the OFF edge, emit a few OFF frames (~1000 ms apart) so the request clears.
+    if (batteryPreheatOffFramesLeft > 0) {
+      if (batteryPreheatLastSendMs == 0 ||
+          (now - batteryPreheatLastSendMs) >= BATTERY_PREHEAT_PERIOD_MS) {
+        batteryPreheatLastSendMs = now;
+        sendBatteryPreheatFrame(BATTERY_PREHEAT_OFF);
+        batteryPreheatOffFramesLeft--;
+      }
+    } else {
+      batteryPreheatLastSendMs = 0;
+    }
     return;
   }
 
   g_status.batteryPreheatActive = 1;
-  const uint32_t now = millis();
+  batteryPreheatOffFramesLeft = 3;  // arm OFF frames for the next disable edge
   if (batteryPreheatLastSendMs != 0 &&
-      (now - batteryPreheatLastSendMs) < 500UL) {
+      (now - batteryPreheatLastSendMs) < BATTERY_PREHEAT_PERIOD_MS) {
     return;
   }
   batteryPreheatLastSendMs = now;
-
-  can_frame f = {};
-  f.can_id = CAN_ID_UI_TRIP_PLANNING;
-  f.can_dlc = 8;
-  f.data[0] = 0x05;  // tripPlanningActive + requestActiveBatteryHeating
-  twai_send(f);
+  sendBatteryPreheatFrame(BATTERY_PREHEAT_ON);
 }
 
 // CAN A 璋冭瘯瑕佺偣锛?// TWAI 纭欢杩囨护鍙仛鈥滅矖杩囨护鈥濓紝鍑忓皯鎬荤嚎甯ц繘鍏?RX 闃熷垪鐨勬暟閲忥紱
@@ -704,6 +727,9 @@ static volatile uint32_t canbLastServiceBurstMs = 0;
 constexpr uint32_t CANB_ID_STW_ACTN_RQ = 0x249;
 constexpr uint32_t CANB_ID_BODY_LIGHTING = 0x273;
 constexpr uint32_t CANB_ID_LIGHTING_STATUS = 0x3F5;
+// 0x3C2 VCLEFT_switchStatus: byte0 bit3 = hazardButtonPressed; data[3] bits0..5
+// = VCLEFT_swcRightScrollTicks (6-bit signed, + forward / - back).
+constexpr uint32_t CANB_ID_VCLEFT_SWITCH = 0x3C2;
 constexpr uint8_t HIGH_BEAM_STROBE_PULSES = 8;
 constexpr uint8_t REAR_FOG_PEDAL_STROBE_PULSES = 3;
 constexpr uint8_t REAR_FOG_BODY_STROBE_PULSES = 6;
@@ -714,7 +740,7 @@ constexpr uint8_t REAR_FOG_PRIORITY_REVERSE = 3;
 constexpr uint16_t HIGH_BEAM_STROBE_INTERVAL_MS = 75;
 constexpr uint16_t HIGH_BEAM_STROBE_RESEND_MS = 45;
 constexpr uint16_t REAR_FOG_STROBE_INTERVAL_MS = 135;
-constexpr uint16_t REVERSE_STROBE_INTERVAL_MS = 135;
+constexpr uint16_t REVERSE_STROBE_INTERVAL_MS = 500;  // 0.5s 每相位(亮/灭)，4 次更易看清
 constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
 constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
 constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
@@ -726,6 +752,14 @@ constexpr uint8_t STALK_STATUS_IDLE = 0;
 constexpr uint8_t STALK_STATUS_PULL = 1;
 constexpr uint8_t STALK_TURN_IDLE = 0;
 constexpr uint8_t STALK_TURN_HAZARD = 6;
+constexpr uint8_t VCLEFT_HAZARD_BUTTON_MASK = 0x08;  // 0x3C2 byte0 bit3
+// 0x3C2 is multiplexed by byte0 bits0..1. Capture: mux0 carries hazardButton +
+// counter/CRC (data[3] is 0x55 filler); mux1 carries rightScrollTicks in data[3]
+// (6-bit signed, idle 0). Reading data[3] without checking the mux misreads
+// mux0's 0x55 as +21 ticks.
+constexpr uint8_t VCLEFT_MUX_MASK = 0x03;
+constexpr uint8_t VCLEFT_MUX_HAZARD = 0x00;  // mux0: hazard button
+constexpr uint8_t VCLEFT_MUX_SCROLL = 0x01;  // mux1: right scroll ticks
 constexpr uint8_t REAR_FOG_MASK = 0x80;
 constexpr uint8_t REAR_FOG_OFF = 0x10;
 constexpr uint8_t REAR_FOG_ON = 0x90;
@@ -733,6 +767,10 @@ static can_frame canbLastStwActnRqFrame{};
 static bool canbHasLastStwActnRqFrame = false;
 static can_frame canbLastBodyLightingFrame{};
 static bool canbHasLastBodyLightingFrame = false;
+static can_frame canbLastVcleftSwitchFrame{};
+static bool canbHasLastVcleftSwitchFrame = false;
+static can_frame canbLastVcleftMux0Frame{};      // last 0x3C2 mux0 frame (hazard + counter/CRC)
+static bool canbHasLastVcleftMux0Frame = false;
 static volatile uint8_t highBeamStalkLastCounter = 0;
 
 static volatile bool highBeamStrobeActive = false;
@@ -770,6 +808,7 @@ static volatile bool reverseStrobeOutputOn = false;
 static volatile uint8_t reverseStrobePulsesRemaining = 0;
 static volatile uint32_t reverseStrobeLastToggleMs = 0;
 static uint8_t lastDIGearRaw = 0;
+static volatile bool g_brakePedalActive = false;
 
 // CAN B read budget per loop pass 鈥?bounded so it can never starve CAN A.
 constexpr uint8_t CANB_RX_SCAN_LIMIT = 4;
@@ -822,7 +861,7 @@ static bool applyCanBFilters(bool enabled) {
     if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF4, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
-    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
   } else {
     if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
     // WebUI 鍏抽棴杩囨护锛歮ask=0 鎺ユ敹鍏ㄩ儴鏍囧噯甯э紝鏂逛究瀹炶溅鎶撳寘/璋冭瘯鏂?ID銆?    if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
@@ -902,25 +941,27 @@ static can_frame highBeamFrame(uint8_t status) {
   return f;
 }
 
-static can_frame stalkTurnFrame(uint8_t turnStatus) {
+// Hazard via VCLEFT_switchStatus (0x3C2): reuse the latest live frame and only
+// set/clear byte0 bit3 (hazardButtonPressed), leaving the counter/CRC bytes as
+// the car last sent them. Capture: press = 08 55 55 55 00 00 59 45.
+// NOTE: hazard is a momentary BUTTON (toggles hazards); pulse behaviour still
+// needs on-vehicle validation.
+static can_frame vcleftHazardFrame(bool pressed) {
   can_frame f = {};
-  if (canbHasLastStwActnRqFrame) {
-    f = canbLastStwActnRqFrame;
+  if (canbHasLastVcleftMux0Frame) {
+    f = canbLastVcleftMux0Frame;  // reuse a real mux0 frame (its counter/CRC bytes)
   } else {
-    f.can_id = CANB_ID_STW_ACTN_RQ;
-    f.can_dlc = 4;
+    // Captured mux0 idle VCLEFT_switchStatus (hazard released).
+    static const uint8_t baseData[8] = {0x00, 0x55, 0x55, 0x55, 0x00, 0x00, 0x59, 0x45};
+    f.can_dlc = 8;
+    memcpy(f.data, baseData, sizeof(f.data));
   }
+  f.can_id = CANB_ID_VCLEFT_SWITCH;
   if (f.can_dlc < 4) f.can_dlc = 4;
-  f.can_id = CANB_ID_STW_ACTN_RQ;
-
-  const uint8_t status = STALK_STATUS_IDLE;
-  const uint8_t counter = static_cast<uint8_t>((highBeamStalkLastCounter + 1) & 0x0F);
-  f.data[0] = stalkCrc249(counter, status);
-  f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
-  f.data[2] = static_cast<uint8_t>((f.data[2] & ~0x07) | (turnStatus & 0x07));
-  highBeamStalkLastCounter = counter;
-  canbLastStwActnRqFrame = f;
-  canbHasLastStwActnRqFrame = true;
+  f.data[0] = static_cast<uint8_t>(f.data[0] & static_cast<uint8_t>(~VCLEFT_MUX_MASK));  // force mux0
+  f.data[0] = pressed
+    ? static_cast<uint8_t>(f.data[0] | VCLEFT_HAZARD_BUTTON_MASK)
+    : static_cast<uint8_t>(f.data[0] & static_cast<uint8_t>(~VCLEFT_HAZARD_BUTTON_MASK));
   return f;
 }
 
@@ -1001,7 +1042,7 @@ static void startRearFogBrakeStrobe(uint8_t pulses, uint8_t priority, bool manua
 
 static void stopReverseStrobe(bool sendOff) {
   if (sendOff && canbReady) {
-    canb_send(stalkTurnFrame(STALK_TURN_IDLE));
+    canb_send(vcleftHazardFrame(false));
     canb_send(rearFogFrame(false));
   }
   reverseStrobeActive = false;
@@ -1171,10 +1212,10 @@ static void serviceReverseStrobe(const RuntimeConfig& cfg) {
   reverseStrobeLastToggleMs = now;
 
   if (!reverseStrobeOutputOn) {
-    canb_send(stalkTurnFrame(STALK_TURN_HAZARD));
+    canb_send(vcleftHazardFrame(true));
     reverseStrobeOutputOn = true;
   } else {
-    canb_send(stalkTurnFrame(STALK_TURN_IDLE));
+    canb_send(vcleftHazardFrame(false));
     reverseStrobeOutputOn = false;
     if (reverseStrobePulsesRemaining > 0) reverseStrobePulsesRemaining--;
     if (reverseStrobePulsesRemaining == 0) {
@@ -1260,6 +1301,7 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
       readBitsLE(frame, 31, 1, raw) && raw != 0;
     const bool brakeTorque =
       readBitsLE(frame, 51, 13, raw) && raw > 0;
+    g_brakePedalActive = (driverBrake || brakeApply);  // shared with 0x3C2 scroll-gear trigger
     handleRearFogPedalBrakeEdge(driverBrake || brakeApply, cfg);
     if (brakeLamp) rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
     if (brakeTorque) rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
@@ -1385,6 +1427,42 @@ static void handleCanBFrame(const can_frame& frame) {
     const RuntimeConfig cfg = configSnapshot();
     const bool brakeActive = (frame.data[7] & 0x01) != 0;
     handleRearFogBrakeLampState(brakeActive, cfg);
+  }
+
+  if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
+    canbLastVcleftSwitchFrame = frame;
+    canbHasLastVcleftSwitchFrame = true;
+    const uint8_t mux = static_cast<uint8_t>(frame.data[0] & VCLEFT_MUX_MASK);
+
+    // mux0 carries the hazard button + valid counter/CRC bytes; cache it so the
+    // injected hazard frame rides a real recent counter/CRC.
+    if (mux == VCLEFT_MUX_HAZARD) {
+      canbLastVcleftMux0Frame = frame;
+      canbHasLastVcleftMux0Frame = true;
+    }
+
+    // rightScrollTicks lives ONLY in mux1 (data[3], 6-bit signed, idle 0). Other
+    // muxes use data[3] as 0x55 filler — reading it there gave a phantom +21
+    // scroll that cancelled the reverse strobe while braking. Gate on the mux.
+    if (mux == VCLEFT_MUX_SCROLL) {
+      const uint8_t scrollRaw = static_cast<uint8_t>(frame.data[3] & 0x3F);
+      const int8_t scrollTicks = (scrollRaw & 0x20)
+        ? static_cast<int8_t>(static_cast<int>(scrollRaw) - 64)
+        : static_cast<int8_t>(scrollRaw);
+
+      // Brake + right-scroll as a gear-intent trigger source only. The real D/R
+      // gear command (0x109 SBW_RQ_SCCM) CRC is unknown, so we do NOT inject it.
+      //   brake + scroll back (<0) = R intent -> arm reverse hazard/fog strobe
+      //   brake + scroll fwd  (>0) = D intent -> cancel the reverse strobe
+      const RuntimeConfig cfg = configSnapshot();
+      if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollTicks != 0) {
+        if (scrollTicks < 0) {
+          if (!reverseStrobeActive) startReverseStrobe();
+        } else if (reverseStrobeActive) {
+          stopReverseStrobe(true);
+        }
+      }
+    }
   }
 }
 
@@ -1816,6 +1894,9 @@ static void saveConfigToPrefs() {
 static void setupLightWebUi() {
   setupRecorderBuffer();
   WiFi.mode(WIFI_AP);
+  // SoftAP IP / gateway = 100.100.1.1 (subnet 255.255.255.0). Must precede softAP().
+  WiFi.softAPConfig(IPAddress(100, 100, 1, 1), IPAddress(100, 100, 1, 1),
+                    IPAddress(255, 255, 255, 0));
   WiFi.softAP(WEBUI_AP_SSID, WEBUI_AP_PASS);
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
