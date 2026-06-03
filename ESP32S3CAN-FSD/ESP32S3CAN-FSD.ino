@@ -740,7 +740,11 @@ constexpr uint8_t REAR_FOG_PRIORITY_REVERSE = 3;
 constexpr uint16_t HIGH_BEAM_STROBE_INTERVAL_MS = 75;
 constexpr uint16_t HIGH_BEAM_STROBE_RESEND_MS = 45;
 constexpr uint16_t REAR_FOG_STROBE_INTERVAL_MS = 135;
-constexpr uint16_t REVERSE_STROBE_INTERVAL_MS = 500;  // 0.5s 每相位(亮/灭)，4 次更易看清
+// Hazard (0x3C2 bit3) is a momentary TOGGLE button: one click toggles hazards
+// on/off. Reverse = one click ON -> hold REVERSE_HAZARD_ON_MS (car flashes
+// continuously) -> one click OFF. (Pulsing it would just toggle on/off/on/off.)
+constexpr uint16_t REVERSE_HAZARD_CLICK_MS = 200;   // length of one button "press"
+constexpr uint16_t REVERSE_HAZARD_ON_MS = 2500;     // hazards stay on ~2.5s of continuous flashing
 constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
 constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
 constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
@@ -804,9 +808,8 @@ static bool rearFogMildDecelTriggered = false;
 static bool rearFogHardDecelTriggered = false;
 static float rearFogLastVehicleSpeedKph = -1.0f;
 static volatile bool reverseStrobeActive = false;
-static volatile bool reverseStrobeOutputOn = false;
-static volatile uint8_t reverseStrobePulsesRemaining = 0;
-static volatile uint32_t reverseStrobeLastToggleMs = 0;
+static volatile uint8_t reverseStrobePhase = 0;       // 0 idle, 1 ON-press, 2 hold(flashing), 3 OFF-press
+static volatile uint32_t reverseStrobePhaseEnd = 0;
 static uint8_t lastDIGearRaw = 0;
 static volatile bool g_brakePedalActive = false;
 
@@ -1042,13 +1045,12 @@ static void startRearFogBrakeStrobe(uint8_t pulses, uint8_t priority, bool manua
 
 static void stopReverseStrobe(bool sendOff) {
   if (sendOff && canbReady) {
-    canb_send(vcleftHazardFrame(false));
+    canb_send(vcleftHazardFrame(false));  // ensure the hazard button is released
     canb_send(rearFogFrame(false));
   }
   reverseStrobeActive = false;
-  reverseStrobeOutputOn = false;
-  reverseStrobePulsesRemaining = 0;
-  reverseStrobeLastToggleMs = 0;
+  reverseStrobePhase = 0;
+  reverseStrobePhaseEnd = 0;
   g_status.reverseStrobeActive = 0;
   g_status.reverseStrobeRemaining = 0;
 }
@@ -1056,11 +1058,11 @@ static void stopReverseStrobe(bool sendOff) {
 static void startReverseStrobe() {
   if (!canbReady) return;
   reverseStrobeActive = true;
-  reverseStrobeOutputOn = false;
-  reverseStrobePulsesRemaining = REVERSE_STROBE_PULSES;
-  reverseStrobeLastToggleMs = 0;
+  reverseStrobePhase = 1;                                 // ON-press
+  reverseStrobePhaseEnd = millis() + REVERSE_HAZARD_CLICK_MS;
+  canb_send(vcleftHazardFrame(true));                     // single press edge -> hazards ON
   g_status.reverseStrobeActive = 1;
-  g_status.reverseStrobeRemaining = REVERSE_STROBE_PULSES;
+  g_status.reverseStrobeRemaining = 1;
   startRearFogBrakeStrobe(REVERSE_STROBE_PULSES, REAR_FOG_PRIORITY_REVERSE, true);
 }
 
@@ -1192,40 +1194,38 @@ static void serviceHighBeamStrobe(const RuntimeConfig& cfg) {
 static void serviceReverseStrobe(const RuntimeConfig& cfg) {
   if (!canbReady) return;
   if (!cfg.canbEnabled) {
-    if (reverseStrobeActive || reverseStrobeOutputOn) stopReverseStrobe(false);
+    if (reverseStrobePhase != 0) stopReverseStrobe(false);
     return;
   }
   if (!cfg.reverseStrobeEnabled) {
-    if (reverseStrobeActive || reverseStrobeOutputOn) stopReverseStrobe(true);
+    if (reverseStrobePhase != 0) stopReverseStrobe(true);
     lastDIGearRaw = 0;
     return;
   }
-  if (!reverseStrobeActive) return;
+  if (reverseStrobePhase == 0) return;
 
   const uint32_t now = millis();
-  if (reverseStrobeLastToggleMs != 0 &&
-      (now - reverseStrobeLastToggleMs) < REVERSE_STROBE_INTERVAL_MS) {
+  if ((int32_t)(now - reverseStrobePhaseEnd) < 0) {
     g_status.reverseStrobeActive = 1;
-    g_status.reverseStrobeRemaining = reverseStrobePulsesRemaining;
-    return;
+    return;  // current phase still running
   }
-  reverseStrobeLastToggleMs = now;
 
-  if (!reverseStrobeOutputOn) {
-    canb_send(vcleftHazardFrame(true));
-    reverseStrobeOutputOn = true;
-  } else {
-    canb_send(vcleftHazardFrame(false));
-    reverseStrobeOutputOn = false;
-    if (reverseStrobePulsesRemaining > 0) reverseStrobePulsesRemaining--;
-    if (reverseStrobePulsesRemaining == 0) {
+  switch (reverseStrobePhase) {
+    case 1:  // ON-press done -> release button; hold while the car flashes
+      canb_send(vcleftHazardFrame(false));
+      reverseStrobePhase = 2;
+      reverseStrobePhaseEnd = now + REVERSE_HAZARD_ON_MS;
+      break;
+    case 2:  // hold done -> press again to toggle hazards back off
+      canb_send(vcleftHazardFrame(true));
+      reverseStrobePhase = 3;
+      reverseStrobePhaseEnd = now + REVERSE_HAZARD_CLICK_MS;
+      break;
+    default:  // case 3: OFF-press done -> release and finish
       stopReverseStrobe(true);
       return;
-    }
   }
-
   g_status.reverseStrobeActive = 1;
-  g_status.reverseStrobeRemaining = reverseStrobePulsesRemaining;
 }
 
 static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg) {
