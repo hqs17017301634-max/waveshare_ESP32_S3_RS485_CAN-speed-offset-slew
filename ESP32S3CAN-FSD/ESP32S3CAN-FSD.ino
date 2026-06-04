@@ -152,6 +152,9 @@ struct RuntimeConfig {
   bool rearFogBrakeStrobeEnabled = false; // arms brake-triggered 0x273 rear fog burst
   bool reverseStrobeEnabled = false;  // arms reverse-gear hazard + rear-fog burst
   bool batteryPreheatEnabled = false; // sends UI_tripPlanning 0x082 every 500 ms
+  bool scrollGearSimEnabled = true;    // show brake + right-scroll D/R intent only
+  bool scrollGearInjectEnabled = false; // experimental: inject 0x229 right-stalk D/R request
+  bool can1ReceiveOnly = false;        // CAN A listen/RX-only: gate all TWAI TX (FSD/offset/preheat)
 };
 
 static RuntimeConfig g_config;
@@ -174,6 +177,18 @@ struct RuntimeStatus {
   uint8_t reverseStrobeActive = 0;
   uint8_t reverseStrobeRemaining = 0;
   uint8_t batteryPreheatActive = 0;
+  int8_t rightScrollTicks = 0;
+  uint8_t rightStalkStatus = 0;
+  uint8_t rightStalkCounter = 0;
+  uint8_t currentGear = 0;
+  uint8_t brakeActive = 0;
+  int8_t scrollGearIntent = 0;       // -1=R, 0=none, 1=D
+  uint8_t scrollGearDryRun = 0;
+  uint8_t scrollGearInjectActive = 0;
+  uint8_t scrollGearInjectTarget = 0; // 2=R, 4=D
+  uint8_t scrollGearInjectOk = 0;
+  uint8_t scrollGearInjectBlocked = 0;
+  int vehicleSpeedKph = 0;
 
   int fusedLimitKph = 0;
   int targetSpeedKph = 0;
@@ -205,13 +220,14 @@ static inline void applyBuildModeGuards(RuntimeConfig& c) {
 #ifdef ENABLE_CANA_FULL_RECORDER
   c.fsdEnabled = false;
   c.autoSpeedOffsetEnabled = false;
-  c.canbEnabled = false;
+  c.canbEnabled = true;
   c.canbServiceModeEnabled = false;
   c.canbFilterEnabled = false;
   c.highBeamStrobeEnabled = false;
   c.rearFogBrakeStrobeEnabled = false;
   c.reverseStrobeEnabled = false;
   c.batteryPreheatEnabled = false;
+  c.scrollGearInjectEnabled = false;
 #else
   (void)c;
 #endif
@@ -329,6 +345,7 @@ static void serviceTwaiAlerts();
 static void serviceBatteryPreheat(const RuntimeConfig& cfg);
 
 static bool twai_send(const can_frame& frame) {
+  if (g_config.can1ReceiveOnly) return false;  // CAN A RX-only: block all our TWAI transmits
   if (frame.can_dlc > 8) return false;
 
   twai_message_t msg = {};
@@ -741,8 +758,11 @@ static volatile uint32_t canbLastServiceBurstMs = 0;
 // CAN B feature IDs:
 //   0x249: SCCMLeftStalk command. status=1 PULL triggers high-light strobe;
 //          injected strobe uses only status=1 PULL and status=0 idle.
+//   0x229: SCCM_rightStalk. Captured D/R request source on bus2; optional
+//          experimental scroll-to-gear injection uses this frame.
 //   0x273: body lighting frame used for brake/fog context and rear-fog strobe.
 //   0x3F5: lighting feedback frame; accepted by the hardware filter for logging.
+constexpr uint32_t CANB_ID_SCCM_RIGHT_STALK = 0x229;
 constexpr uint32_t CANB_ID_STW_ACTN_RQ = 0x249;
 constexpr uint32_t CANB_ID_BODY_LIGHTING = 0x273;
 constexpr uint32_t CANB_ID_LIGHTING_STATUS = 0x3F5;
@@ -767,6 +787,12 @@ constexpr uint16_t REVERSE_HAZARD_ON_MS = 2500;     // hazards stay on ~2.5s of 
 constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
 constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
 constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
+constexpr uint16_t SCROLL_GEAR_BRAKE_HOLD_MS = 150;
+constexpr uint16_t SCROLL_GEAR_FRAME_INTERVAL_MS = 70;
+constexpr uint16_t SCROLL_GEAR_IDLE_FRAMES = 3;
+constexpr uint16_t SCROLL_GEAR_STATUS_FRAMES = 4;
+constexpr uint16_t SCROLL_GEAR_COOLDOWN_MS = 1500;
+constexpr float SCROLL_GEAR_MAX_SPEED_KPH = 2.0f;
 constexpr float REAR_FOG_MILD_DECEL_THRESHOLD = -0.80f;
 constexpr float REAR_FOG_HARD_DECEL_THRESHOLD = -2.50f;
 constexpr float REAR_FOG_VERY_HARD_DECEL_THRESHOLD = -3.50f;
@@ -775,6 +801,13 @@ constexpr uint8_t STALK_STATUS_IDLE = 0;
 constexpr uint8_t STALK_STATUS_PULL = 1;
 constexpr uint8_t STALK_TURN_IDLE = 0;
 constexpr uint8_t STALK_TURN_HAZARD = 6;
+constexpr uint8_t RIGHT_STALK_IDLE = 0;
+constexpr uint8_t RIGHT_STALK_R_STAGE1 = 1;
+constexpr uint8_t RIGHT_STALK_R_STAGE2 = 2;
+constexpr uint8_t RIGHT_STALK_D_STAGE1 = 3;
+constexpr uint8_t RIGHT_STALK_D_STAGE2 = 4;
+constexpr uint8_t GEAR_R = 2;
+constexpr uint8_t GEAR_D = 4;
 constexpr uint8_t VCLEFT_HAZARD_BUTTON_MASK = 0x08;  // 0x3C2 byte0 bit3
 // 0x3C2 is multiplexed by byte0 bits0..1. Capture: mux0 carries hazardButton +
 // counter/CRC (data[3] is 0x55 filler); mux1 carries rightScrollTicks in data[3]
@@ -788,6 +821,9 @@ constexpr uint8_t REAR_FOG_OFF = 0x10;
 constexpr uint8_t REAR_FOG_ON = 0x90;
 static can_frame canbLastStwActnRqFrame{};
 static bool canbHasLastStwActnRqFrame = false;
+static can_frame canbLastRightStalkFrame{};
+static bool canbHasLastRightStalkFrame = false;
+static volatile uint8_t rightStalkTxCounter = 0;
 static can_frame canbLastBodyLightingFrame{};
 static bool canbHasLastBodyLightingFrame = false;
 static can_frame canbLastVcleftSwitchFrame{};
@@ -831,6 +867,17 @@ static volatile uint8_t reverseStrobePhase = 0;       // 0 idle, 1 ON-press, 2 h
 static volatile uint32_t reverseStrobePhaseEnd = 0;
 static uint8_t lastDIGearRaw = 0;
 static volatile bool g_brakePedalActive = false;
+static volatile uint32_t g_brakePedalActiveSinceMs = 0;
+static volatile float g_vehicleSpeedKph = 0.0f;
+static volatile bool g_vehicleSpeedValid = false;
+static volatile bool scrollGearShiftActive = false;
+static volatile uint8_t scrollGearTargetGear = 0;
+static volatile uint8_t scrollGearPhaseIndex = 0;
+static volatile uint8_t scrollGearIdleFramesRemaining = 0;
+static volatile uint32_t scrollGearNextTxMs = 0;
+static volatile uint32_t scrollGearCooldownUntilMs = 0;
+static volatile bool scrollGearLatched = false;
+static volatile uint8_t scrollGearLastBlocked = 0;
 
 // CAN B read budget per loop pass 鈥?bounded so it can never starve CAN A.
 constexpr uint8_t CANB_RX_SCAN_LIMIT = 4;
@@ -846,6 +893,8 @@ static void serviceCanBScheduledTx();
 static void serviceHighBeamStrobe(const RuntimeConfig& cfg);
 static void serviceReverseStrobe(const RuntimeConfig& cfg);
 static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg);
+static void serviceScrollGearShift(const RuntimeConfig& cfg);
+static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig& cfg, bool cacheHazardFrame);
 
 static void setupCanB() {
   canbReady = false;
@@ -881,7 +930,7 @@ static bool applyCanBFilters(bool enabled) {
 
     if (canb.setFilterMask(MCP2515::MASK1, false, 0x7FF) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
-    if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_SCCM_RIGHT_STALK) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF4, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
   } else {
@@ -961,6 +1010,131 @@ static can_frame highBeamFrame(uint8_t status) {
   f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
   highBeamStalkLastCounter = counter;
   return f;
+}
+
+static void setBrakePedalActive(bool active) {
+  const uint32_t now = millis();
+  if (active && !g_brakePedalActive) g_brakePedalActiveSinceMs = now;
+  if (!active) g_brakePedalActiveSinceMs = 0;
+  g_brakePedalActive = active;
+  g_status.brakeActive = active ? 1 : 0;
+}
+
+static uint8_t rightStalkCrc229(uint8_t counter, uint8_t status) {
+  static const uint8_t base[16] = {
+    0x46, 0x44, 0x52, 0x6D, 0x43, 0x41, 0xDD, 0xF9,
+    0x4C, 0xA5, 0xF6, 0x8C, 0x49, 0x2F, 0x31, 0x3B
+  };
+  static const uint8_t offset[8] = {
+    0x00, 0xE0, 0xEF, 0x0F, 0xF1, 0x00, 0x00, 0x00
+  };
+  return static_cast<uint8_t>(base[counter & 0x0F] ^ offset[status & 0x07]);
+}
+
+static uint8_t rightStalkNextCounter() {
+  rightStalkTxCounter = static_cast<uint8_t>((rightStalkTxCounter + 1) & 0x0F);
+  g_status.rightStalkCounter = rightStalkTxCounter;
+  return rightStalkTxCounter;
+}
+
+static can_frame rightStalkFrame(uint8_t status) {
+  can_frame f = {};
+  f.can_id = CANB_ID_SCCM_RIGHT_STALK;
+  f.can_dlc = 8;
+  const uint8_t counter = rightStalkNextCounter();
+  f.data[0] = rightStalkCrc229(counter, status);
+  f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
+  return f;
+}
+
+static bool scrollGearSafetyOk(uint8_t targetGear) {
+  const uint32_t now = millis();
+  if (targetGear != GEAR_D && targetGear != GEAR_R) {
+    scrollGearLastBlocked = 1;
+    return false;
+  }
+  if (!g_brakePedalActive || g_brakePedalActiveSinceMs == 0 ||
+      (now - g_brakePedalActiveSinceMs) < SCROLL_GEAR_BRAKE_HOLD_MS) {
+    scrollGearLastBlocked = 2;
+    return false;
+  }
+  if (!g_vehicleSpeedValid || g_vehicleSpeedKph > SCROLL_GEAR_MAX_SPEED_KPH) {
+    scrollGearLastBlocked = 3;
+    return false;
+  }
+  if (g_status.currentGear == targetGear) {
+    scrollGearLastBlocked = 4;
+    return false;
+  }
+  if ((int32_t)(now - scrollGearCooldownUntilMs) < 0) {
+    scrollGearLastBlocked = 5;
+    return false;
+  }
+  scrollGearLastBlocked = 0;
+  return true;
+}
+
+static void requestScrollGearShift(uint8_t targetGear, const RuntimeConfig& cfg) {
+  g_status.scrollGearIntent = (targetGear == GEAR_D) ? 1 : (targetGear == GEAR_R ? -1 : 0);
+  g_status.scrollGearDryRun = cfg.scrollGearSimEnabled ? 1 : 0;
+  g_status.scrollGearInjectBlocked = 0;
+  g_status.scrollGearInjectOk = 0;
+  g_status.scrollGearInjectTarget = targetGear;
+
+  if (!cfg.scrollGearInjectEnabled) return;
+  if (scrollGearShiftActive) return;
+  if (!scrollGearSafetyOk(targetGear)) {
+    g_status.scrollGearInjectBlocked = scrollGearLastBlocked;
+    return;
+  }
+
+  scrollGearShiftActive = true;
+  scrollGearTargetGear = targetGear;
+  scrollGearPhaseIndex = 0;
+  scrollGearIdleFramesRemaining = 0;
+  scrollGearNextTxMs = 0;
+  g_status.scrollGearInjectActive = 1;
+}
+
+static void serviceScrollGearShift(const RuntimeConfig& cfg) {
+  if (!scrollGearShiftActive) {
+    g_status.scrollGearInjectActive = 0;
+    return;
+  }
+  if (!canbReady || !cfg.canbEnabled || !cfg.scrollGearInjectEnabled ||
+      !scrollGearSafetyOk(scrollGearTargetGear)) {
+    canb_send(rightStalkFrame(RIGHT_STALK_IDLE));
+    scrollGearShiftActive = false;
+    scrollGearCooldownUntilMs = millis() + SCROLL_GEAR_COOLDOWN_MS;
+    g_status.scrollGearInjectActive = 0;
+    g_status.scrollGearInjectBlocked = scrollGearLastBlocked;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (scrollGearNextTxMs != 0 && (int32_t)(now - scrollGearNextTxMs) < 0) return;
+
+  uint8_t status = RIGHT_STALK_IDLE;
+  if (scrollGearPhaseIndex < SCROLL_GEAR_STATUS_FRAMES) {
+    if (scrollGearTargetGear == GEAR_R) {
+      status = (scrollGearPhaseIndex == 0) ? RIGHT_STALK_R_STAGE1 : RIGHT_STALK_R_STAGE2;
+    } else {
+      status = (scrollGearPhaseIndex == 0) ? RIGHT_STALK_D_STAGE1 : RIGHT_STALK_D_STAGE2;
+    }
+    scrollGearPhaseIndex++;
+  } else if (scrollGearIdleFramesRemaining < SCROLL_GEAR_IDLE_FRAMES) {
+    status = RIGHT_STALK_IDLE;
+    scrollGearIdleFramesRemaining++;
+  } else {
+    scrollGearShiftActive = false;
+    scrollGearCooldownUntilMs = now + SCROLL_GEAR_COOLDOWN_MS;
+    g_status.scrollGearInjectActive = 0;
+    g_status.scrollGearInjectOk = (g_status.currentGear == scrollGearTargetGear) ? 1 : 0;
+    return;
+  }
+
+  canb_send(rightStalkFrame(status));
+  scrollGearNextTxMs = now + SCROLL_GEAR_FRAME_INTERVAL_MS;
 }
 
 // Hazard via VCLEFT_switchStatus (0x3C2): reuse the latest live frame and only
@@ -1311,6 +1485,11 @@ static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& c
 static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg) {
   const uint32_t now = millis();
 
+  if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
+    handleVcleftSwitchFrame(frame, cfg, false);
+    return;
+  }
+
   if (frame.can_id == CAN_ID_BRAKE_PEDAL && frame.can_dlc >= 8) {
     uint32_t raw = 0;
     const bool brakeLamp = readBitsLE(frame, 21, 1, raw) && raw != 0;
@@ -1320,7 +1499,7 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
       readBitsLE(frame, 31, 1, raw) && raw != 0;
     const bool brakeTorque =
       readBitsLE(frame, 51, 13, raw) && raw > 0;
-    g_brakePedalActive = (driverBrake || brakeApply);  // shared with 0x3C2 scroll-gear trigger
+    setBrakePedalActive(driverBrake || brakeApply);  // shared with 0x3C2 scroll-gear trigger
     handleRearFogPedalBrakeEdge(driverBrake || brakeApply, cfg);
     if (brakeLamp) rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
     if (brakeTorque) rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
@@ -1345,6 +1524,9 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
 
   if (frame.can_id == CAN_ID_DI_SYSTEM_STATUS && frame.can_dlc >= 8) {
     const uint8_t gearRaw = static_cast<uint8_t>((frame.data[2] >> 5) & 0x07);
+    g_status.currentGear = gearRaw;
+    uint32_t brakeRaw = 0;
+    if (readBitsLE(frame, 19, 2, brakeRaw)) setBrakePedalActive(brakeRaw == 2);
     if (cfg.reverseStrobeEnabled && gearRaw == 2 && lastDIGearRaw != 2) {
       startReverseStrobe();
     }
@@ -1399,6 +1581,9 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
       static_cast<uint16_t>((static_cast<uint16_t>(frame.data[2]) << 4) | (frame.data[1] >> 4));
     float speedKph = static_cast<float>(rawSpeed) * 0.08f - 40.0f;
     if (speedKph < 0.0f) speedKph = 0.0f;
+    g_vehicleSpeedKph = speedKph;
+    g_vehicleSpeedValid = true;
+    g_status.vehicleSpeedKph = static_cast<int>(speedKph + 0.5f);
     if (rearFogLastVehicleSpeedKph >= 0.0f &&
         speedKph + 0.5f < rearFogLastVehicleSpeedKph) {
       rearFogRecentSpeedFallingUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
@@ -1406,6 +1591,45 @@ static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeCon
     rearFogLastVehicleSpeedKph = speedKph;
     return;
   }
+}
+
+static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig& cfg, bool cacheHazardFrame) {
+  if (frame.can_dlc < 4) return;
+  if (cacheHazardFrame) {
+    canbLastVcleftSwitchFrame = frame;
+    canbHasLastVcleftSwitchFrame = true;
+  }
+
+  const uint8_t mux = static_cast<uint8_t>(frame.data[0] & VCLEFT_MUX_MASK);
+  if (cacheHazardFrame && mux == VCLEFT_MUX_HAZARD) {
+    canbLastVcleftMux0Frame = frame;
+    canbHasLastVcleftMux0Frame = true;
+  }
+
+  if (mux != VCLEFT_MUX_SCROLL) return;
+
+  const uint8_t scrollRaw = static_cast<uint8_t>(frame.data[3] & 0x3F);
+  const int8_t scrollTicks = (scrollRaw & 0x20)
+    ? static_cast<int8_t>(static_cast<int>(scrollRaw) - 64)
+    : static_cast<int8_t>(scrollRaw);
+  g_status.rightScrollTicks = scrollTicks;
+
+  const bool scrollEdge = (scrollTicks != 0) && !scrollGearLatched;
+  if (scrollTicks == 0) {
+    scrollGearLatched = false;
+  } else if (scrollEdge && g_brakePedalActive) {
+    const uint8_t targetGear = (scrollTicks < 0) ? GEAR_R : GEAR_D;
+    requestScrollGearShift(targetGear, cfg);
+  }
+
+  if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollEdge) {
+    if (scrollTicks < 0) {
+      if (!reverseStrobeActive) startReverseStrobe();
+    } else if (reverseStrobeActive) {
+      stopReverseStrobe(true);
+    }
+  }
+  if (scrollTicks != 0) scrollGearLatched = true;
 }
 
 static void handleCanBFrame(const can_frame& frame) {
@@ -1438,6 +1662,16 @@ static void handleCanBFrame(const can_frame& frame) {
     highBeamLastPullDown = pullDown;
   }
 
+  if (frame.can_id == CANB_ID_SCCM_RIGHT_STALK && frame.can_dlc >= 2) {
+    canbLastRightStalkFrame = frame;
+    canbHasLastRightStalkFrame = true;
+    const uint8_t status = static_cast<uint8_t>((frame.data[1] >> 4) & 0x07);
+    const uint8_t counter = static_cast<uint8_t>(frame.data[1] & 0x0F);
+    g_status.rightStalkStatus = status;
+    g_status.rightStalkCounter = counter;
+    rightStalkTxCounter = counter;
+  }
+
   if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 8) {
     canbLastBodyLightingFrame = frame;
     // 0x273 璺緞锛氬彧鐢?data[7] bit0 鐨勫埞杞︿笂鍗囨部瑙﹀彂锛屼笉鍦ㄨ繖閲岀洿鎺ュ彂閫併€?    canbLastBodyLightingFrame = frame;
@@ -1449,6 +1683,8 @@ static void handleCanBFrame(const can_frame& frame) {
   }
 
   if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
+    handleVcleftSwitchFrame(frame, configSnapshot(), true);
+    return;
     canbLastVcleftSwitchFrame = frame;
     canbHasLastVcleftSwitchFrame = true;
     const uint8_t mux = static_cast<uint8_t>(frame.data[0] & VCLEFT_MUX_MASK);
@@ -1468,19 +1704,28 @@ static void handleCanBFrame(const can_frame& frame) {
       const int8_t scrollTicks = (scrollRaw & 0x20)
         ? static_cast<int8_t>(static_cast<int>(scrollRaw) - 64)
         : static_cast<int8_t>(scrollRaw);
+      g_status.rightScrollTicks = scrollTicks;
 
-      // Brake + right-scroll as a gear-intent trigger source only. The real D/R
-      // gear command (0x109 SBW_RQ_SCCM) CRC is unknown, so we do NOT inject it.
-      //   brake + scroll back (<0) = R intent -> arm reverse hazard/fog strobe
-      //   brake + scroll fwd  (>0) = D intent -> cancel the reverse strobe
+      // Brake + right-scroll as a gear-intent trigger source. Dry-run is always
+      // status-only; experimental injection sends bus2 0x229 only when the WebUI
+      // injection switch and all safety gates are true.
       const RuntimeConfig cfg = configSnapshot();
-      if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollTicks != 0) {
+      const bool scrollEdge = (scrollTicks != 0) && !scrollGearLatched;
+      if (scrollTicks == 0) {
+        scrollGearLatched = false;
+      } else if (scrollEdge && g_brakePedalActive) {
+        const uint8_t targetGear = (scrollTicks < 0) ? GEAR_R : GEAR_D;
+        requestScrollGearShift(targetGear, cfg);
+      }
+
+      if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollEdge) {
         if (scrollTicks < 0) {
           if (!reverseStrobeActive) startReverseStrobe();
         } else if (reverseStrobeActive) {
           stopReverseStrobe(true);
         }
       }
+      if (scrollTicks != 0) scrollGearLatched = true;
     }
   }
 }
@@ -1557,7 +1802,7 @@ static void handleStatus() {
   RuntimeStatus s = g_status;
 
   String j;
-  j.reserve(800);
+  j.reserve(1300);
   j += '{';
   j += "\"fsdEnabled\":";            j += c.fsdEnabled ? 1 : 0;
   j += ",\"autoSpeedOffsetEnabled\":"; j += c.autoSpeedOffsetEnabled ? 1 : 0;
@@ -1584,6 +1829,9 @@ static void handleStatus() {
   j += ",\"rearFogBrakeStrobeEnabled\":"; j += c.rearFogBrakeStrobeEnabled ? 1 : 0;
   j += ",\"reverseStrobeEnabled\":"; j += c.reverseStrobeEnabled ? 1 : 0;
   j += ",\"batteryPreheatEnabled\":"; j += c.batteryPreheatEnabled ? 1 : 0;
+  j += ",\"scrollGearSimEnabled\":"; j += c.scrollGearSimEnabled ? 1 : 0;
+  j += ",\"scrollGearInjectEnabled\":"; j += c.scrollGearInjectEnabled ? 1 : 0;
+  j += ",\"can1ReceiveOnly\":"; j += c.can1ReceiveOnly ? 1 : 0;
   j += ",\"can1Rx\":";               j += s.can1Rx;
   j += ",\"can1Tx\":";               j += s.can1Tx;
   j += ",\"can1TxFail\":";           j += s.can1TxFail;
@@ -1599,6 +1847,18 @@ static void handleStatus() {
   j += ",\"reverseStrobeActive\":"; j += s.reverseStrobeActive;
   j += ",\"reverseStrobeRemaining\":"; j += s.reverseStrobeRemaining;
   j += ",\"batteryPreheatActive\":"; j += s.batteryPreheatActive;
+  j += ",\"rightScrollTicks\":";     j += s.rightScrollTicks;
+  j += ",\"rightStalkStatus\":";     j += s.rightStalkStatus;
+  j += ",\"rightStalkCounter\":";    j += s.rightStalkCounter;
+  j += ",\"currentGear\":";          j += s.currentGear;
+  j += ",\"brakeActive\":";          j += s.brakeActive;
+  j += ",\"scrollGearIntent\":";     j += s.scrollGearIntent;
+  j += ",\"scrollGearDryRun\":";     j += s.scrollGearDryRun;
+  j += ",\"scrollGearInjectActive\":"; j += s.scrollGearInjectActive;
+  j += ",\"scrollGearInjectTarget\":"; j += s.scrollGearInjectTarget;
+  j += ",\"scrollGearInjectOk\":";   j += s.scrollGearInjectOk;
+  j += ",\"scrollGearInjectBlocked\":"; j += s.scrollGearInjectBlocked;
+  j += ",\"vehicleSpeedKph\":";      j += s.vehicleSpeedKph;
   j += ",\"fusedLimitKph\":";        j += s.fusedLimitKph;
   j += ",\"targetSpeedKph\":";       j += s.targetSpeedKph;
   j += ",\"offsetKph\":";            j += s.offsetKph;
@@ -1644,6 +1904,9 @@ static void handleConfig() {
   c.rearFogBrakeStrobeEnabled = argBool("rearFogBrakeStrobeEnabled", c.rearFogBrakeStrobeEnabled);
   c.reverseStrobeEnabled    = argBool("reverseStrobeEnabled", c.reverseStrobeEnabled);
   c.batteryPreheatEnabled   = argBool("batteryPreheatEnabled", c.batteryPreheatEnabled);
+  c.scrollGearSimEnabled    = argBool("scrollGearSimEnabled", c.scrollGearSimEnabled);
+  c.scrollGearInjectEnabled = argBool("scrollGearInjectEnabled", c.scrollGearInjectEnabled);
+  c.can1ReceiveOnly        = argBool("can1ReceiveOnly", c.can1ReceiveOnly);
 
   const bool newServiceMode = argBool("canbServiceModeEnabled", c.canbServiceModeEnabled);
   const bool serviceModeChanged = (newServiceMode != c.canbServiceModeEnabled);
@@ -1880,6 +2143,9 @@ static void loadConfigFromPrefs() {
   c.rearFogBrakeStrobeEnabled = prefs.getBool("fogBrake", c.rearFogBrakeStrobeEnabled);
   c.reverseStrobeEnabled   = prefs.getBool("revStrobe", c.reverseStrobeEnabled);
   c.batteryPreheatEnabled  = prefs.getBool("batHeat", c.batteryPreheatEnabled);
+  c.scrollGearSimEnabled   = prefs.getBool("gearSim", c.scrollGearSimEnabled);
+  c.scrollGearInjectEnabled = prefs.getBool("gearInject", c.scrollGearInjectEnabled);
+  c.can1ReceiveOnly        = prefs.getBool("can1RxOnly", c.can1ReceiveOnly);
   prefs.end();
   applyBuildModeGuards(c);
 
@@ -1909,6 +2175,9 @@ static void saveConfigToPrefs() {
   prefs.putBool("fogBrake", c.rearFogBrakeStrobeEnabled);
   prefs.putBool("revStrobe", c.reverseStrobeEnabled);
   prefs.putBool("batHeat", c.batteryPreheatEnabled);
+  prefs.putBool("gearSim", c.scrollGearSimEnabled);
+  prefs.putBool("gearInject", c.scrollGearInjectEnabled);
+  prefs.putBool("can1RxOnly", c.can1ReceiveOnly);
   prefs.end();
 }
 
@@ -2004,6 +2273,7 @@ void loop() {
     didWork = true;
     digitalWrite(PIN_LED, LOW);
     recordCanFrame(frame, 'R', 1);
+    handleRearFogCanADecelFrame(frame, configSnapshot());
   }
 #else
   if (twai_recv(frame)) {
@@ -2025,10 +2295,12 @@ void loop() {
     serviceHighBeamStrobe(canbCfg);
     serviceReverseStrobe(canbCfg);
     serviceRearFogBrakeStrobe(canbCfg);
+    serviceScrollGearShift(canbCfg);
   } else {
     serviceHighBeamStrobe(canbCfg);
     serviceReverseStrobe(canbCfg);
     serviceRearFogBrakeStrobe(canbCfg);
+    serviceScrollGearShift(canbCfg);
   }
 #endif
 

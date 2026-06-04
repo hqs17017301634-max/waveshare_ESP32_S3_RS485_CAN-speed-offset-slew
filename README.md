@@ -288,21 +288,23 @@ WebUI build:
 pio run -e lilygo_t2can_arduino_webui
 ```
 
-Experimental CAN A full-frame recorder build:
+Experimental CAN A/B full-frame recorder build:
 
 ```bash
 pio run -e lilygo_t2can_cana_full_recorder
 pio run -e lilygo_t2can_cana_full_recorder -t upload --upload-port COMx
 ```
 
-This build is for finding unknown CAN A IDs such as `0x109 SBW_RQ_SCCM`.
-It keeps the normal `lilygo_t2can_arduino_webui` environment untouched, bypasses
-the CAN A software ID filter, drains more TWAI RX frames per loop, and forces
-all TX-capable features off (`FSD`, speed offset, CAN B light strobes, reverse
+This build is for finding unknown IDs such as `0x109 SBW_RQ_SCCM` across the
+two T-2CAN inputs. It keeps the normal `lilygo_t2can_arduino_webui` environment
+untouched, bypasses the CAN A software ID filter, leaves CAN B enabled with its
+hardware filter off, drains more TWAI RX frames per loop, and forces all
+TX-capable features off (`FSD`, speed offset, CAN B light strobes, reverse
 strobe, and battery preheat). In the WebUI recorder, leave the ID field empty
 for a short all-frame capture, or enter `109` to capture only the suspected
-shift request. To restore the normal firmware, flash `lilygo_t2can_arduino_webui`
-again or switch back to the `T-2CAN-WEB` branch.
+shift request. CSV `bus=1` is CAN A and `bus=2` is CAN B. To restore the normal
+firmware, flash `lilygo_t2can_arduino_webui` again or switch back to the
+`T-2CAN-WEB` branch.
 
 The WebUI build enables LILYGO T-2CAN OPI PSRAM:
 
@@ -587,19 +589,19 @@ WebUI 构建：
 pio run -e lilygo_t2can_arduino_webui
 ```
 
-CAN A 全量抓包实验构建：
+CAN A/B 双路全量抓包实验构建：
 
 ```bash
 pio run -e lilygo_t2can_cana_full_recorder
 pio run -e lilygo_t2can_cana_full_recorder -t upload --upload-port COMx
 ```
 
-这个构建用于查找 `0x109 SBW_RQ_SCCM` 等未知 CAN A 报文。它不影响正常
-`lilygo_t2can_arduino_webui` 环境，会绕过 CAN A 软件 ID 过滤、提高每轮
-TWAI RX drain 数量，并强制关闭所有会发帧的功能（FSD、速度偏移、CAN B 灯光、
-倒车爆闪、电池预热）。WebUI 抓包输入框留空就是短时间全量抓包；只填 `109`
-则只抓疑似换挡请求。恢复正常固件时，重新烧录 `lilygo_t2can_arduino_webui`
-或切回 `T-2CAN-WEB` 分支即可。
+这个构建用于在 T-2CAN 两路输入上查找 `0x109 SBW_RQ_SCCM` 等未知报文。它不影响正常
+`lilygo_t2can_arduino_webui` 环境，会绕过 CAN A 软件 ID 过滤、保持 CAN B 开启且关闭
+CAN B 硬件过滤、提高每轮 TWAI RX drain 数量，并强制关闭所有会发帧的功能（FSD、
+速度偏移、CAN B 灯光、倒车爆闪、电池预热）。WebUI 抓包输入框留空就是短时间全量抓包；
+只填 `109` 则只抓疑似换挡请求。CSV 中 `bus=1` 是 CAN A，`bus=2` 是 CAN B。
+恢复正常固件时，重新烧录 `lilygo_t2can_arduino_webui` 或切回 `T-2CAN-WEB` 分支即可。
 
 WebUI 构建会开启 LILYGO T-2CAN OPI PSRAM：
 
