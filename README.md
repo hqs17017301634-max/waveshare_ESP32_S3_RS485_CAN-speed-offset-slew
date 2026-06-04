@@ -19,6 +19,19 @@ Current behavior:
 - AP control `mux 2` writes speed offset to `data[1]` bits 0..5.
 - TWAI bus-off recovery, TX retry, frame/DLC validation.
 
+## Project Architecture
+
+This branch is a single-bus Arduino / PlatformIO ESP32-S3 firmware. The primary
+entry point is `ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`; no WebUI, Bluetooth, OTA,
+dashboard, recorder, or secondary CAN runtime is started.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN A / CAN1 | ESP32-S3 built-in TWAI | The only CAN interface. It receives HW4 AP-control and follow-distance frames, edits the HW4 activation/profile/offset fields, and transmits the modified frame. |
+| Main loop | Arduino `loop()` | Services TWAI alerts, receives bounded CAN frames, validates ID/DLC, and runs the HW4 handler. |
+| Runtime logic | HW4 frame handler | Tracks follow-distance-derived driving style and writes fixed `+15 kph` speed offset on AP-control mux 2. |
+| Configuration | Compile-time constants | No WebUI or persistent runtime config; behavior is fixed by this branch's source and PlatformIO build flags. |
+
 ## FSD Activation (`1021`)
 
 | mux | Operation |
