@@ -16,6 +16,19 @@
 
 The branch focuses on one job: listen for HW3 CAN frames, modify the FSD activation/profile bits, and re-send the modified frames.
 
+### Project Architecture
+
+This branch is a minimal Arduino-style RP2040 firmware with one external
+MCP2515 CAN controller over SPI1. It keeps only the HW3 handler path and avoids
+optional runtime systems.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN bus | MCP2515 over SPI1 | Single CAN interface at 500 kbps. Receives HW3 target frames and transmits edited frames. |
+| MCU runtime | RP2040 Arduino sketch | Owns setup/loop, MCP2515 initialization, frame receive/transmit, and LED/status handling. |
+| Runtime logic | Minimal HW3 handler | Tracks follow-distance/profile state and applies only the required HW3 FSD/profile bit edits. |
+| Configuration | Compile-time constants | Pins, SPI speed, and HW3 behavior are fixed at build time; no WebUI, recorder, or persistent config exists. |
+
 ### Target Hardware
 
 - MCU: RP2040 board
@@ -95,6 +108,18 @@ Use this branch when you want the least code and the narrowest behavior surface 
 `RP2040CAN-HW3` 是最小化的 RP2040 + MCP2515 HW3 分支。它删除了 HW4、Legacy、融合限速读取、速度偏移注入，以及可选运行逻辑。
 
 这个分支只专注一件事：监听 HW3 CAN 帧，修改 FSD 激活/速度档 bit，然后重发修改后的帧。
+
+### 项目架构
+
+本分支是最小化 Arduino 风格 RP2040 固件，使用一路外置 MCP2515 通过 SPI1
+接入 CAN。它只保留 HW3 handler 路径，不启动可选运行时系统。
+
+| 层级 | 组件 | 作用 |
+|------|------|------|
+| CAN 总线 | MCP2515 SPI1 | 单 CAN 接口，500 kbps。接收 HW3 目标帧并发送编辑后的帧。 |
+| MCU 运行时 | RP2040 Arduino sketch | 负责 setup/loop、MCP2515 初始化、帧收发和 LED/状态处理。 |
+| 运行逻辑 | 最小 HW3 handler | 保存跟车距离/速度档状态，只应用 HW3 FSD/速度档所需 bit 修改。 |
+| 配置 | 编译期常量 | 引脚、SPI 速率和 HW3 行为在构建时固定；没有 WebUI、抓包器或持久化配置。 |
 
 ### 目标硬件
 
