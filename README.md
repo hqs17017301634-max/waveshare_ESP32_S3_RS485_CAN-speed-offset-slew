@@ -16,6 +16,21 @@
 
 No WiFi, Bluetooth, OTA, Web UI, or dashboard runtime is initialized.
 
+### Project Architecture
+
+This branch is an Arduino / PlatformIO ESP32-S3 firmware. The primary firmware
+entry point is `ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`; the optional lightweight
+WebUI is kept in `ESP32S3CAN-FSD/web_ui_page.h` so the CAN fast path remains
+simple.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN A / CAN1 | ESP32-S3 built-in TWAI | Primary FSD/speed-control bus. Reads speed-limit, brake/deceleration, gear, and AP-control context; transmits modified FSD/control frames when enabled. |
+| CAN B / CAN2 | MCP2515 over SPI, only on LILYGO T-2CAN builds | Auxiliary body/lighting bus for flash-to-pass strobe, rear fog strobe, reverse hazard trigger, lighting feedback, right-scroll detection, battery preheat, and recorder context. |
+| Main loop | Arduino `loop()` | Runs the bounded CAN fast path, services TWAI alerts, drains CAN B with a budget, and advances non-blocking strobe/preheat state machines. |
+| WebUI task | FreeRTOS task on core 0 | Optional SoftAP control/status page. It only reads cached status and updates config; CAN work remains in the main loop. |
+| Capture | PSRAM recorder | Stores binary CAN frames in PSRAM first, then streams CSV only after recording stops. No SPIFFS/LittleFS writes occur in the CAN fast path. |
+
 ### Target Hardware
 
 - Board: Waveshare ESP32-S3-RS485-CAN
@@ -320,6 +335,20 @@ Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FS
 `ESP32-FSD` 是面向 Waveshare ESP32-S3-RS485-CAN 的增强版 ESP32-S3 TWAI 分支。它是纯 CAN、仅 HW3 的固件，但包含目前最有实际价值的一套功能：FSD 激活、跟车距离速度档控制、基于融合限速的速度偏移、PCT4 编码、下降 slew 限幅，以及 TWAI 稳定性处理。
 
 不会初始化 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
+
+### 项目架构
+
+本分支是 Arduino / PlatformIO 架构的 ESP32-S3 固件。主固件入口是
+`ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`；可选轻量 WebUI 放在
+`ESP32S3CAN-FSD/web_ui_page.h`，避免页面字符串干扰 CAN 快路径。
+
+| 层级 | 组件 | 作用 |
+|------|------|------|
+| CAN A / CAN1 | ESP32-S3 原生 TWAI | 主 FSD/速度控制总线。读取限速、刹车/减速、档位、AP 控制上下文；启用时发送修改后的 FSD/控制帧。 |
+| CAN B / CAN2 | MCP2515 SPI，仅 LILYGO T-2CAN 构建使用 | 辅助车身/灯光总线，用于高光爆闪、后雾灯爆闪、倒车双闪触发、灯态反馈、右滚轮识别、电池预热和抓包上下文。 |
+| 主循环 | Arduino `loop()` | 运行有预算限制的 CAN 快路径，处理 TWAI alert，按预算读取 CAN B，并推进非阻塞灯光/预热状态机。 |
+| WebUI 任务 | FreeRTOS core 0 任务 | 可选 SoftAP 控制/状态页。只读取缓存状态和更新配置，CAN 工作仍留在主循环。 |
+| 抓包 | PSRAM recorder | 先把二进制 CAN 帧写入 PSRAM，停止抓包后再流式导出 CSV；CAN 快路径不写 SPIFFS/LittleFS。 |
 
 ### 目标硬件
 
