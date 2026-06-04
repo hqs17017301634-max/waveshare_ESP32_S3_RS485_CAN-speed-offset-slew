@@ -382,7 +382,7 @@ static bool twai_recv(can_frame& frame) {
     if (msg.extd || msg.rtr || msg.data_length_code > 8) {
       continue;
     }
-#ifndef ENABLE_CANA_FULL_RECORDER
+#if !defined(ENABLE_CANA_FULL_RECORDER) && !defined(BD_ON_CAN1)
     if (!isRelevantCanId(msg.identifier)) continue;
 #endif
 
@@ -788,9 +788,9 @@ constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
 constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
 constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
 constexpr uint16_t SCROLL_GEAR_BRAKE_HOLD_MS = 150;
-constexpr uint16_t SCROLL_GEAR_FRAME_INTERVAL_MS = 70;
+constexpr uint16_t SCROLL_GEAR_FRAME_INTERVAL_MS = 50;  // ~20Hz, matches/dominates real 0x229 (10Hz)
 constexpr uint16_t SCROLL_GEAR_IDLE_FRAMES = 3;
-constexpr uint16_t SCROLL_GEAR_STATUS_FRAMES = 4;
+constexpr uint16_t SCROLL_GEAR_STATUS_FRAMES = 6;        // sustain detent longer (manual D=5,R=~7 frames)
 constexpr uint16_t SCROLL_GEAR_COOLDOWN_MS = 1500;
 constexpr float SCROLL_GEAR_MAX_SPEED_KPH = 2.0f;
 constexpr float REAR_FOG_MILD_DECEL_THRESHOLD = -0.80f;
@@ -953,6 +953,15 @@ static bool applyCanBFilters(bool enabled) {
 
 static bool canb_recv(can_frame& frame) {
   if (!canbReady) return false;
+#ifdef BD_ON_CAN1
+  // Experiment: the BD bus is wired to the ESP32-S3 TWAI controller, so the
+  // lighting/stalk/scroll-gear stack reads its frames from TWAI (better timing
+  // than MCP2515). twai_recv() already bumps can1Rx.
+  if (!twai_recv(frame)) return false;
+  canbLastId = frame.can_id;
+  recordCanFrame(frame, 'R', 1);
+  return true;
+#else
   if (canb.readMessage(&frame) != MCP2515::ERROR_OK) return false;
 
   // Stage 1: ignore extended and remote frames; clamp DLC defensively.
@@ -966,12 +975,15 @@ static bool canb_recv(can_frame& frame) {
   g_status.canbLastId = canbLastId;
   recordCanFrame(frame, 'R', 2);
   return true;
+#endif
 }
 
 static bool canb_send(const can_frame& frame) {
   if (!canbReady) return false;
   if (frame.can_dlc > 8) return false;
-
+#ifdef BD_ON_CAN1
+  return twai_send(frame);  // BD is on TWAI in this experiment
+#else
   // One short retry on a busy/failed mailbox; no blocking delay so a stuck
   // CAN B can never stall CAN A.
   for (uint8_t attempt = 0; attempt < 2; ++attempt) {
@@ -985,6 +997,7 @@ static bool canb_send(const can_frame& frame) {
   canbTxFailCount++;
   g_status.canbTxFail = canbTxFailCount;
   return false;
+#endif
 }
 
 static uint8_t readStalkStatus(const can_frame& frame) {
@@ -1040,7 +1053,7 @@ static uint8_t rightStalkNextCounter() {
 static can_frame rightStalkFrame(uint8_t status) {
   can_frame f = {};
   f.can_id = CANB_ID_SCCM_RIGHT_STALK;
-  f.can_dlc = 8;
+  f.can_dlc = 3;  // real SCCM_rightStalk is DLC=3 (cap80); DLC=8 was rejected
   const uint8_t counter = rightStalkNextCounter();
   f.data[0] = rightStalkCrc229(counter, status);
   f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
@@ -1485,10 +1498,14 @@ static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& c
 static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg) {
   const uint32_t now = millis();
 
+#ifndef BD_ON_CAN1
+  // On BD_ON_CAN1 the 0x3C2 frame is handled once by handleCanBFrame() (same TWAI
+  // bus), so skip it here to avoid double-processing the scroll edge.
   if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
     handleVcleftSwitchFrame(frame, cfg, false);
     return;
   }
+#endif
 
   if (frame.can_id == CAN_ID_BRAKE_PEDAL && frame.can_dlc >= 8) {
     uint32_t raw = 0;
@@ -1669,7 +1686,12 @@ static void handleCanBFrame(const can_frame& frame) {
     const uint8_t counter = static_cast<uint8_t>(frame.data[1] & 0x0F);
     g_status.rightStalkStatus = status;
     g_status.rightStalkCounter = counter;
-    rightStalkTxCounter = counter;
+    // Only re-align our TX counter to the live SCCM counter when we are NOT
+    // injecting. During an active scroll-gear burst the counter must free-run
+    // strictly +1 (like the real stalk); re-syncing here would let incoming
+    // idle frames yank it back and produce duplicate counters in our own TX,
+    // which the gear receiver rejects.
+    if (!scrollGearShiftActive) rightStalkTxCounter = counter;
   }
 
   if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 8) {
@@ -1733,11 +1755,24 @@ static void handleCanBFrame(const can_frame& frame) {
 static void drainCanBWithBudget() {
   if (!canbReady) return;
 
+#ifdef BD_ON_CAN1
+  // BD is on TWAI here and is a busy bus (~2400 fps), so drain more per loop.
+  // Feed each frame to both the gear/brake/speed parser (for the scroll-gear
+  // safety gate) and the lighting/stalk/scroll handler.
+  const RuntimeConfig cfg = configSnapshot();
+  for (uint8_t i = 0; i < 48; ++i) {
+    can_frame frame;
+    if (!canb_recv(frame)) break;
+    handleRearFogCanADecelFrame(frame, cfg);  // 0x118 gear / 0x145 brake / speed (0x3C2 skipped here)
+    handleCanBFrame(frame);                    // 0x249 / 0x229 / 0x273 / 0x3C2 stalk+scroll+hazard
+  }
+#else
   for (uint8_t i = 0; i < CANB_RX_SCAN_LIMIT; ++i) {
     can_frame frame;
     if (!canb_recv(frame)) break;
     handleCanBFrame(frame);
   }
+#endif
 }
 
 // VCSEC_serviceDiagnosticRequest (0x339) on the BODY bus / CAN B.
@@ -2242,13 +2277,21 @@ void setup() {
   g_config_twai.rx_queue_len = TWAI_RX_QUEUE_LEN;
   g_config_twai.tx_queue_len = TWAI_TX_QUEUE_LEN;
   twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
+#ifdef BD_ON_CAN1
+  // BD bus on TWAI: accept every ID so 0x229/0x3C2/0x118/0x145/0x249/0x273 all arrive.
+  twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+#else
   twai_filter_config_t  f_config = { CAN_ACCEPT_CODE, CAN_ACCEPT_MASK, true };
+#endif
 
   twai_driver_install(&g_config_twai, &t_config, &f_config);
   twai_start();
   twai_reconfigure_alerts(TWAI_ALERT_MASK, nullptr);
 
-#ifdef ENABLE_CANB_MCP2515
+#ifdef BD_ON_CAN1
+  // CAN B logic runs on TWAI here; do not init the MCP2515 (it would be CH/unused).
+  canbReady = true;
+#elif defined(ENABLE_CANB_MCP2515)
   setupCanB();
 #endif
 
@@ -2264,6 +2307,20 @@ void loop() {
   bool didWork = false;
 
   can_frame frame;
+#ifdef BD_ON_CAN1
+  // Experiment: BD wired to TWAI. Run only the lighting/stalk/scroll-gear stack
+  // on TWAI; FSD activation / speed offset / battery preheat are NOT sent
+  // (this is not CH). drainCanBWithBudget() reads TWAI via canb_recv().
+  (void)frame;
+  RuntimeConfig canbCfg = configSnapshot();
+  drainCanBWithBudget();
+  serviceCanBScheduledTx();
+  serviceHighBeamStrobe(canbCfg);
+  serviceReverseStrobe(canbCfg);
+  serviceRearFogBrakeStrobe(canbCfg);
+  serviceScrollGearShift(canbCfg);
+  didWork = true;
+#else
 #ifdef ENABLE_CANA_FULL_RECORDER
 #ifndef CANA_FULL_RECORDER_RX_BUDGET
 #define CANA_FULL_RECORDER_RX_BUDGET 120
@@ -2305,6 +2362,7 @@ void loop() {
 #endif
 
   serviceBatteryPreheat(configSnapshot());
+#endif  // BD_ON_CAN1
 
   if (!didWork) {
     digitalWrite(PIN_LED, HIGH);
