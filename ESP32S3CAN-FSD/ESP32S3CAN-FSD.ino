@@ -1040,7 +1040,7 @@ static uint8_t rightStalkNextCounter() {
 static can_frame rightStalkFrame(uint8_t status) {
   can_frame f = {};
   f.can_id = CANB_ID_SCCM_RIGHT_STALK;
-  f.can_dlc = 8;
+  f.can_dlc = 3;  // real SCCM_rightStalk is DLC=3 (cap80); DLC=8 was rejected -> no shift
   const uint8_t counter = rightStalkNextCounter();
   f.data[0] = rightStalkCrc229(counter, status);
   f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
@@ -1669,7 +1669,9 @@ static void handleCanBFrame(const can_frame& frame) {
     const uint8_t counter = static_cast<uint8_t>(frame.data[1] & 0x0F);
     g_status.rightStalkStatus = status;
     g_status.rightStalkCounter = counter;
-    rightStalkTxCounter = counter;
+    // Only re-align our TX counter when NOT injecting; during a burst the counter
+    // must free-run +1 (re-syncing here makes our own TX frames duplicate -> reject).
+    if (!scrollGearShiftActive) rightStalkTxCounter = counter;
   }
 
   if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 8) {
