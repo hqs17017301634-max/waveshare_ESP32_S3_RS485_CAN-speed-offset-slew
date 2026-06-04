@@ -16,6 +16,19 @@
 
 This is the simplest ESP32 branch: HW3 activation/profile control only, no speed-limit offset feature.
 
+### Project Architecture
+
+This branch is a single-bus Arduino / PlatformIO ESP32-S3 firmware. The main
+entry point is `ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`; no WebUI, Bluetooth, OTA,
+dashboard, recorder, or secondary CAN runtime is started.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN A / CAN1 | ESP32-S3 built-in TWAI | The only CAN interface. It receives HW3 FSD/AP-control frames, modifies the activation/profile fields, and transmits the edited frame. |
+| Main loop | Arduino `loop()` | Services TWAI alerts, receives bounded CAN frames, validates ID/DLC, and runs the minimal HW3 handler. |
+| Runtime logic | Minimal HW3 frame handler | Keeps follow-distance/profile state and applies only the required HW3 activation/profile bit edits. |
+| Configuration | Compile-time constants | No WebUI or persistent runtime config; behavior is fixed by this branch's source and PlatformIO build flags. |
+
 ### Target Hardware
 
 - Board: Waveshare ESP32-S3-RS485-CAN
@@ -113,6 +126,19 @@ Use this branch when you want ESP32-S3 hardware, built-in TWAI CAN, and the simp
 `ESP32-HW3` 是最小 HW3 激活固件的 ESP32-S3 TWAI 移植版。它保留 `RP2040CAN-HW3` 的窄行为范围，但把外置 MCP2515/SPI 换成 ESP32-S3 内置 TWAI CAN 控制器。
 
 这是最简单的 ESP32 分支：只做 HW3 激活/速度档控制，不做限速偏移。
+
+### 项目架构
+
+本分支是单 CAN 总线的 Arduino / PlatformIO ESP32-S3 固件。主入口是
+`ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`；不会启动 WebUI、蓝牙、OTA、Dashboard、
+抓包器或第二路 CAN。
+
+| 层级 | 组件 | 作用 |
+|------|------|------|
+| CAN A / CAN1 | ESP32-S3 原生 TWAI | 唯一 CAN 接口。接收 HW3 FSD/AP 控制帧，修改激活/速度档字段，再发送修改后的帧。 |
+| 主循环 | Arduino `loop()` | 处理 TWAI alert，按预算接收 CAN 帧，校验 ID/DLC，并运行最小 HW3 处理器。 |
+| 运行逻辑 | 最小 HW3 帧处理器 | 保存跟车距离/速度档状态，只应用 HW3 激活/速度档所需 bit 修改。 |
+| 配置 | 编译期常量 | 没有 WebUI 或持久化运行配置；行为由本分支源码和 PlatformIO build flags 固定。 |
 
 ### 目标硬件
 
