@@ -56,13 +56,18 @@ button.alt{background:#37c}button.warn{background:#a33}
 <p class="hint">倒挡双闪雾灯：CAN A 0x118 识别 DI_gear=R，或 踩刹车+右滚轮向后(0x3C2 rightScrollTicks&lt;0)，触发双闪(0x3C2 hazard 按钮 byte0 bit3)+后雾灯 4 次；双闪按钮帧需实车验证。</p>
 <label>电池预热启用<input type="checkbox" id="batteryPreheatEnabled"></label>
 <p class="hint">电池预热：开启后 CAN A 每 1000ms 发送 0x082 UI_tripPlanning ON 帧(AF 50 AC 3C FF 03 9A 0F)；关闭后补发数帧 OFF(01 50 AC 3C FF 03 9A 0F)。</p>
+<label>CAN1(13/14) 只收不发<input type="checkbox" id="can1ReceiveOnly"></label>
+<p class="hint">CAN1 只收不发：屏蔽 CAN A 全部发送（FSD 激活/限速偏移/电池预热），仅保留接收与录制。把 CAN A 接到 PARTY 等陌生总线做被动嗅探时建议打开。</p>
+<label>滚轮换挡仿真<input type="checkbox" id="scrollGearSimEnabled"></label>
+<label>滚轮换挡实验注入<input type="checkbox" id="scrollGearInjectEnabled"></label>
+<p class="hint">滚轮换挡：CAN A 0x3C2 mux1 识别右滚轮；CAN B 0x229 解码右拨杆；仿真只显示将请求 D/R，不发帧。实验注入默认关闭，仅在踩刹车、低速、目标挡位不同等安全门控通过时发送 0x229。</p>
 <div class="result" id="testResult"></div>
 </div>
 
 <div class="card">
 <h2>CAN 抓包</h2>
-<p class="hint">默认抓取 CAN A/B 灯光与 FSD 相关上下文。清空输入框可抓取全部帧。下载 CSV 前请先停止抓包。</p>
-<input type="text" id="recIds" value="082,111,116,118,145,148,185,186,257,273,249,3F5">
+<p class="hint">CAN A/B 双路全量抓包固件：留空记录全部标准帧；只抓换挡请求可填 109。CSV 中 bus=1 是 CAN A，bus=2 是 CAN B；下载前请先停止抓包。</p>
+<input type="text" id="recIds" value="">
 <div>
 <button onclick="startRec()">开始抓包</button>
 <button class="warn" onclick="stopRec()">停止</button>
@@ -97,12 +102,24 @@ button.alt{background:#37c}button.warn{background:#a33}
 <div class="kv"><span>倒挡双闪雾灯中</span><span id="reverseStrobeActive">-</span></div>
 <div class="kv"><span>倒挡剩余次数</span><span id="reverseStrobeRemaining">-</span></div>
 <div class="kv"><span>电池预热发送中</span><span id="batteryPreheatActive">-</span></div>
+<div class="kv"><span>当前挡位 0x118</span><span id="currentGear">-</span></div>
+<div class="kv"><span>刹车状态</span><span id="brakeActive">-</span></div>
+<div class="kv"><span>车速 kph</span><span id="vehicleSpeedKph">-</span></div>
+<div class="kv"><span>右滚轮 ticks 0x3C2</span><span id="rightScrollTicks">-</span></div>
+<div class="kv"><span>右拨杆 status 0x229</span><span id="rightStalkStatus">-</span></div>
+<div class="kv"><span>右拨杆 counter</span><span id="rightStalkCounter">-</span></div>
+<div class="kv"><span>滚轮换挡意图</span><span id="scrollGearIntent">-</span></div>
+<div class="kv"><span>滚轮换挡仿真</span><span id="scrollGearDryRun">-</span></div>
+<div class="kv"><span>实验注入中</span><span id="scrollGearInjectActive">-</span></div>
+<div class="kv"><span>实验目标挡位</span><span id="scrollGearInjectTarget">-</span></div>
+<div class="kv"><span>实验结果确认</span><span id="scrollGearInjectOk">-</span></div>
+<div class="kv"><span>实验阻止原因</span><span id="scrollGearInjectBlocked">-</span></div>
 </div>
 
 <script>
 let pollTimer=null,recTimer=null,loaded=false;
-const ids=["fsdEnabled","autoSpeedOffsetEnabled","slewPctPerSec","lowSpeedMaxPctRaw","targetBelow60","target60","target70","target80","target90","target100","target120","canbEnabled","canbServiceModeEnabled","canbFilterEnabled","highBeamStrobeEnabled","rearFogBrakeStrobeEnabled","reverseStrobeEnabled","batteryPreheatEnabled"];
-const stats=["can1Rx","can1Tx","can1TxFail","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterEnabled","canbRx","canbTx","canbTxFail","canbLastId","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","reverseStrobeActive","reverseStrobeRemaining","batteryPreheatActive","uptime"];
+const ids=["fsdEnabled","autoSpeedOffsetEnabled","slewPctPerSec","lowSpeedMaxPctRaw","targetBelow60","target60","target70","target80","target90","target100","target120","canbEnabled","canbServiceModeEnabled","canbFilterEnabled","highBeamStrobeEnabled","rearFogBrakeStrobeEnabled","reverseStrobeEnabled","batteryPreheatEnabled","scrollGearSimEnabled","scrollGearInjectEnabled","can1ReceiveOnly"];
+const stats=["can1Rx","can1Tx","can1TxFail","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterEnabled","canbRx","canbTx","canbTxFail","canbLastId","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","reverseStrobeActive","reverseStrobeRemaining","batteryPreheatActive","currentGear","brakeActive","vehicleSpeedKph","rightScrollTicks","rightStalkStatus","rightStalkCounter","scrollGearIntent","scrollGearDryRun","scrollGearInjectActive","scrollGearInjectTarget","scrollGearInjectOk","scrollGearInjectBlocked","uptime"];
 function setVal(id,v){const e=document.getElementById(id);if(!e)return;if(e.type==="checkbox")e.checked=!!v;else e.value=v;}
 function showResult(text){const e=document.getElementById("testResult");if(e)e.textContent=text;}
 function pollStatus(){
