@@ -16,6 +16,19 @@
 
 This branch is useful as a reference implementation because it preserves the wider feature set, but it is not the smallest or most stable branch.
 
+### Project Architecture
+
+This branch is an Arduino-style RP2040 firmware that uses an external MCP2515
+CAN controller over SPI. It is the reference branch for the older multi-handler
+design rather than the newer ESP32-S3/TWAI fast-path architecture.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN bus | MCP2515 over SPI | Single CAN interface at 500 kbps. Receives target frames, applies the selected handler, and transmits edited frames. |
+| MCU runtime | RP2040 Arduino sketch | Owns setup/loop, board pin macros, MCP2515 init, interrupt/polling path, and LED/status handling. |
+| Handler layer | HW3 / HW4 / Legacy handlers | Compile-time-selected logic for the desired vehicle hardware generation and behavior. |
+| Configuration | Compile-time macros | Hardware pins and handler selection are decided at build time; there is no WebUI or persistent runtime config. |
+
 ### Target Hardware
 
 - MCU: RP2040 board
@@ -101,6 +114,18 @@ Use this branch when you want the original RP2040 full-feature reference with HW
 `RP2040CAN-FSD` 是原始 RP2040 + MCP2515 全功能/参考分支。它保留较老的多处理器结构，可以通过编译期宏选择 HW3、HW4 或 Legacy 行为。
 
 这个分支适合作为参考实现，因为功能保留得比较完整；但它不是代码最少、稳定性保护最多的分支。
+
+### 项目架构
+
+本分支是 Arduino 风格的 RP2040 固件，使用外置 MCP2515 通过 SPI 接入 CAN。
+它是较早期多 handler 设计的参考分支，不是后续 ESP32-S3/TWAI 快路径架构。
+
+| 层级 | 组件 | 作用 |
+|------|------|------|
+| CAN 总线 | MCP2515 SPI | 单 CAN 接口，500 kbps。接收目标帧，交给选定 handler 修改，再发送编辑后的帧。 |
+| MCU 运行时 | RP2040 Arduino sketch | 负责 setup/loop、板级引脚宏、MCP2515 初始化、中断/轮询路径和 LED/状态处理。 |
+| 处理层 | HW3 / HW4 / Legacy handlers | 编译期选择对应车辆硬件代际和功能行为。 |
+| 配置 | 编译期宏 | 硬件引脚和 handler 选择在构建时决定；没有 WebUI 或持久化运行配置。 |
 
 ### 目标硬件
 
