@@ -16,6 +16,20 @@
 
 No WiFi, Bluetooth, OTA, Web UI, or dashboard runtime is initialized.
 
+### Repository Architecture
+
+`main` documents the baseline single-CAN ESP32-S3 architecture. Other branches
+specialize this baseline for HW3/HW4, RP2040/MCP2515, LILYGO T-2CAN dual-CAN,
+WebUI, and experimental capture work.
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CAN A / CAN1 | ESP32-S3 built-in TWAI | Single primary CAN interface on the baseline branch. It receives selected AP/FSD frames, applies the speed/profile edits, and transmits the modified frame. |
+| Main loop | Arduino `loop()` | Services TWAI alerts, drains the RX queue with ID/DLC validation, runs the frame handler, and keeps the LED/status behavior simple. |
+| Frame logic | HW3 FSD/speed-offset handler | Tracks follow-distance/profile state, reads fused speed limit, computes PCT4 speed offset, applies slew limiting, and writes `1021` mux fields. |
+| Branch family | ESP32 / RP2040 / T-2CAN branches | ESP32 branches use native TWAI; RP2040 branches use MCP2515 over SPI; T-2CAN branches add a second MCP2515 CAN bus and optional WebUI/PSRAM recorder. |
+| Configuration | PlatformIO build flags | Pins, queue lengths, board targets, and optional feature flags are selected per branch/environment. |
+
 ### Project Architecture
 
 This branch is an Arduino / PlatformIO ESP32-S3 firmware. The primary firmware
@@ -339,6 +353,19 @@ Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FS
 `ESP32-FSD` 是面向 Waveshare ESP32-S3-RS485-CAN 的增强版 ESP32-S3 TWAI 分支。它是纯 CAN、仅 HW3 的固件，但包含目前最有实际价值的一套功能：FSD 激活、跟车距离速度档控制、基于融合限速的速度偏移、PCT4 编码、下降 slew 限幅，以及 TWAI 稳定性处理。
 
 不会初始化 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
+
+### 仓库架构
+
+`main` 说明基线单 CAN ESP32-S3 架构。其它分支在此基础上分别面向
+HW3/HW4、RP2040/MCP2515、LILYGO T-2CAN 双 CAN、WebUI 和实验抓包。
+
+| 层级 | 组件 | 作用 |
+|------|------|------|
+| CAN A / CAN1 | ESP32-S3 原生 TWAI | 基线分支的唯一主 CAN 接口。接收选定 AP/FSD 帧，应用速度/档位修改，再发送修改后的帧。 |
+| 主循环 | Arduino `loop()` | 处理 TWAI alert，带 ID/DLC 校验地读取 RX 队列，运行帧处理器，并保持 LED/状态逻辑简单。 |
+| 帧逻辑 | HW3 FSD/速度偏移处理器 | 保存跟车距离/速度档状态，读取融合限速，计算 PCT4 速度偏移，应用 slew 限幅，并写入 `1021` mux 字段。 |
+| 分支族 | ESP32 / RP2040 / T-2CAN 分支 | ESP32 分支使用原生 TWAI；RP2040 分支使用 MCP2515 SPI；T-2CAN 分支增加第二路 MCP2515 CAN 与可选 WebUI/PSRAM 抓包器。 |
+| 配置 | PlatformIO build flags | 引脚、队列长度、板型目标和可选功能开关按分支/环境选择。 |
 
 ### 项目架构
 
