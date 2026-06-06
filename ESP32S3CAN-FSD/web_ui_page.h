@@ -63,7 +63,7 @@ button.alt,.linkbtn{background:#37c}button.warn{background:#a33}.linkbtn{display
 <label>滚轮换挡启用<input type="checkbox" id="scrollGearInjectEnabled"></label>
 <p class="hint">踩刹车 + 右滚轮，bus=2/MCP2515/物理CANA 发送 0x229，默认关闭。</p>
 <label>电池预热启用<input type="checkbox" id="batteryPreheatEnabled"></label>
-<p class="hint">当前固件：bus=2/MCP2515/物理CANA 每 1000ms 发送 0x082 ON；关闭后补发 OFF。抓包中 0x082 出现在 bus=2，所以当前发送路线与抓包一致。</p>
+<p class="hint">当前固件：bus=2/MCP2515/物理CANA 每 200ms 发送动态 0x082；复用最新有效原车背景字段，只覆盖预热请求位。BMS 温度帧诊断需要硬件过滤设为“接收全部”。</p>
 <label>bus=1/TWAI/物理CANB 只收不发<input type="checkbox" id="can1ReceiveOnly"></label>
 <p class="hint">开启后只屏蔽 TWAI 发送；MCP2515/物理CANA 上的灯光、滚轮和 0x082 不受这个开关阻断。</p>
 <h3>MCP2515 / 物理 CANA</h3>
@@ -110,6 +110,13 @@ button.alt,.linkbtn{background:#37c}button.warn{background:#a33}.linkbtn{display
 <div class="kv"><span>后雾灯爆闪 / 剩余</span><span><b id="rearFogBrakeStrobeActive">-</b> / <b id="rearFogBrakeStrobeRemaining">-</b></span></div>
 <div class="kv"><span>倒挡爆闪 / 剩余</span><span><b id="reverseStrobeActive">-</b> / <b id="reverseStrobeRemaining">-</b></span></div>
 <div class="kv"><span>电池预热发送中</span><span id="batteryPreheatActive">-</span></div>
+<div class="kv"><span>0x082反馈 / 距今ms</span><span><b id="batteryPreheatVehicleSeen">-</b> / <b id="batteryPreheatVehicleAgeMs">-</b></span></div>
+<div class="kv"><span>0x082请求/状态/模板</span><span><b id="batteryPreheatUiRequestHeat">-</b> / <b id="batteryPreheatUiState">-</b> / <b id="batteryPreheatTemplateValid">-</b></span></div>
+<div class="kv"><span>导航超充/快充类型/行程</span><span><b id="batteryPreheatUiNavToSupercharger">-</b> / <b id="batteryPreheatUiFastChargerType">-</b> / <b id="batteryPreheatUiTripActive">-</b></span></div>
+<div class="kv"><span>功率/目标温度/目的地温度</span><span><b id="batteryPreheatUiPowerW">-</b> / <b id="batteryPreheatUiTargetCx100">-</b> / <b id="batteryPreheatUiAmbientCx100">-</b></span></div>
+<div class="kv"><span>BMS温度帧 / bus / 距今ms</span><span><b id="bmsTempFrameSeen">-</b> / <b id="bmsTempFrameBus">-</b> / <b id="bmsTempFrameAgeMs">-</b></span></div>
+<div class="kv"><span>BMS温度ID / mux / raw</span><span><b id="bmsTempFrameId">-</b> / <b id="bmsTempFrameMux">-</b> / <b id="bmsTempFramePayload">-</b></span></div>
+<div class="kv"><span>0x712温度原始组</span><span id="bms712Raw">-</span></div>
 <h3>滚轮换挡</h3>
 <div class="kv"><span>当前挡位 0x118</span><span id="currentGear">-</span></div>
 <div class="kv"><span>刹车 / 车速</span><span><b id="brakeActive">-</b> / <b id="vehicleSpeedKph">-</b></span></div>
@@ -124,11 +131,13 @@ button.alt,.linkbtn{background:#37c}button.warn{background:#a33}.linkbtn{display
 <script>
 let pollTimer=null,recTimer=null,loaded=false;
 const cfgIds=["fsdEnabled","autoSpeedOffsetEnabled","slewPctPerSec","lowSpeedMaxPctRaw","targetBelow60","target60","target70","target80","target90","target100","target120","canbEnabled","canbServiceModeEnabled","canbFilterMode","highBeamStrobeEnabled","rearFogBrakeStrobeEnabled","reverseStrobeEnabled","batteryPreheatEnabled","scrollGearInjectEnabled","can1ReceiveOnly"];
-const stats=["can1Rx","can1Tx","can1TxFail","twaiState","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterMode","canbRx","canbTx","canbTxFail","canbLastId","canbErrorFlags","canbRxOverflowCount","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","reverseStrobeActive","reverseStrobeRemaining","batteryPreheatActive","currentGear","brakeActive","vehicleSpeedKph","rightScrollTicks","rightStalkStatus","rightStalkCounter","scrollGearIntent","scrollGearInjectActive","scrollGearInjectTarget","scrollGearInjectOk","scrollGearInjectBlocked","uptime"];
+const stats=["can1Rx","can1Tx","can1TxFail","twaiState","twaiBusOffCount","fusedLimitKph","targetSpeedKph","offsetKph","offsetRaw","canbReady","canbHardwareFilterMode","canbRx","canbTx","canbTxFail","canbLastId","canbErrorFlags","canbRxOverflowCount","highBeamStrobeActive","highBeamStrobeRemaining","rearFogBrakeStrobeActive","rearFogBrakeStrobeRemaining","reverseStrobeActive","reverseStrobeRemaining","batteryPreheatActive","batteryPreheatVehicleSeen","batteryPreheatVehicleAgeMs","batteryPreheatTemplateValid","batteryPreheatUiTripActive","batteryPreheatUiNavToSupercharger","batteryPreheatUiFastChargerType","batteryPreheatUiState","batteryPreheatUiRequestHeat","batteryPreheatUiPowerW","batteryPreheatUiTargetCx100","batteryPreheatUiAmbientCx100","bmsTempFrameSeen","bmsTempFrameId","bmsTempFrameBus","bmsTempFrameMux","bmsTempFrameAgeMs","bmsTempFramePayload","currentGear","brakeActive","vehicleSpeedKph","rightScrollTicks","rightStalkStatus","rightStalkCounter","scrollGearIntent","scrollGearInjectActive","scrollGearInjectTarget","scrollGearInjectOk","scrollGearInjectBlocked","uptime"];
 function setVal(id,v){const e=document.getElementById(id);if(!e)return;if(e.type==="checkbox")e.checked=!!v;else e.value=v;}
 function getVal(e){return e.type==="checkbox"?(e.checked?1:0):e.value}
 function showResult(text){const e=document.getElementById("testResult");if(e)e.textContent=text}
-function pollStatus(){fetch("/status").then(r=>r.json()).then(j=>{stats.forEach(k=>{const e=document.getElementById(k);if(e&&k in j)e.textContent=(k==="canbLastId"||k==="canbErrorFlags")?("0x"+(j[k]>>>0).toString(16)):j[k]});if(!loaded){cfgIds.forEach(k=>{if(k in j)setVal(k,j[k])});loaded=true}}).catch(()=>{})}
+function fmtStat(k,v){if(k==="canbLastId"||k==="canbErrorFlags"||k==="bmsTempFrameId")return "0x"+(v>>>0).toString(16).toUpperCase();if(k==="batteryPreheatUiPowerW")return v===-32768?"SNA":(v+" W");if(k==="batteryPreheatUiTargetCx100"||k==="batteryPreheatUiAmbientCx100")return v===-32768?"SNA":((v/100).toFixed(2)+" C");if(k==="batteryPreheatUiState")return ["被动加热","主动加热","被动冷却","主动冷却"][v]||v;if(k==="batteryPreheatUiFastChargerType")return ["无","低功率","V2","V3","V4"][v]||v;return v}
+function updateBms712(j){const e=document.getElementById("bms712Raw");if(!e)return;if((j.bmsTempFrameId>>>0)!==0x712){e.textContent="未收到0x712";return}const p=(j.bmsTempFramePayload||"").split(" ");e.textContent="mux "+j.bmsTempFrameMux+" / b1-b7 "+p.slice(1).join(" ")}
+function pollStatus(){fetch("/status").then(r=>r.json()).then(j=>{stats.forEach(k=>{const e=document.getElementById(k);if(e&&k in j)e.textContent=fmtStat(k,j[k])});updateBms712(j);if(!loaded){cfgIds.forEach(k=>{if(k in j)setVal(k,j[k])});loaded=true}}).catch(()=>{})}
 function setPolling(on){if(on&&!pollTimer){pollStatus();pollTimer=setInterval(pollStatus,1000)}if(!on&&pollTimer){clearInterval(pollTimer);pollTimer=null}}
 function body(){const p=new URLSearchParams();cfgIds.forEach(k=>{const e=document.getElementById(k);p.set(k,getVal(e))});return p}
 function applyConfig(){fetch("/config",{method:"POST",body:body()}).then(async r=>{showResult(await r.text());pollStatus()})}

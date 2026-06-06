@@ -187,6 +187,23 @@ struct RuntimeStatus {
   uint8_t reverseStrobeActive = 0;
   uint8_t reverseStrobeRemaining = 0;
   uint8_t batteryPreheatActive = 0;
+  uint8_t batteryPreheatVehicleSeen = 0;
+  uint8_t batteryPreheatTemplateValid = 0;
+  uint8_t batteryPreheatUiTripActive = 0;
+  uint8_t batteryPreheatUiNavToSupercharger = 0;
+  uint8_t batteryPreheatUiFastChargerType = 0;
+  uint8_t batteryPreheatUiState = 0;
+  uint8_t batteryPreheatUiRequestHeat = 0;
+  int batteryPreheatUiPowerW = 0;
+  int batteryPreheatUiTargetCx100 = 0;
+  int batteryPreheatUiAmbientCx100 = 0;
+  uint32_t batteryPreheatVehicleAgeMs = 0;
+  uint8_t bmsTempFrameSeen = 0;
+  uint32_t bmsTempFrameId = 0;
+  uint8_t bmsTempFrameBus = 0;
+  uint8_t bmsTempFrameMux = 0;
+  uint32_t bmsTempFrameAgeMs = 0;
+  char bmsTempFramePayload[24] = "-";
   int8_t rightScrollTicks = 0;
   uint8_t rightStalkStatus = 0;
   uint8_t rightStalkCounter = 0;
@@ -460,6 +477,9 @@ static void serviceTwaiAlerts() {
 constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
 constexpr uint32_t CAN_ID_AP_CONTROL = 1021;
 constexpr uint32_t CAN_ID_UI_TRIP_PLANNING = 0x082;
+constexpr uint32_t CAN_ID_BMS_THERMAL_STATUS = 0x312;
+constexpr uint32_t CAN_ID_BMS_LOG1 = 0x374;
+constexpr uint32_t CAN_ID_BMS_PACK_TEMPERATURES = 0x712;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
 constexpr uint32_t CAN_ID_BRAKE_PEDAL = 0x145;
 constexpr uint32_t CAN_ID_RCM_INERTIAL2_CH = 0x111;
@@ -479,18 +499,74 @@ static inline bool isRelevantCanId(uint32_t canId) {
          canId == CAN_ID_ESP_BRAKE_TORQUE ||
          canId == CAN_ID_DIF_TORQUE ||
          canId == CAN_ID_VEHICLE_SPEED ||
+         canId == CAN_ID_BMS_THERMAL_STATUS ||
+         canId == CAN_ID_BMS_LOG1 ||
+         canId == CAN_ID_BMS_PACK_TEMPERATURES ||
          canId == CAN_ID_DAS_STATUS ||
          canId == CAN_ID_FOLLOW_DISTANCE ||
          canId == CAN_ID_AP_CONTROL;
 }
 
-// Battery-preheat 0x082 UI_tripPlanning payloads — from on-vehicle capture.
-// ON  = AF 50 AC 3C FF 03 9A 0F   (preheat requested, ~1000 ms period)
-// OFF = 01 50 AC 3C FF 03 9A 0F   (request cleared)
-static const uint8_t BATTERY_PREHEAT_ON[8]  = {0xAF, 0x50, 0xAC, 0x3C, 0xFF, 0x03, 0x9A, 0x0F};
-static const uint8_t BATTERY_PREHEAT_OFF[8] = {0x01, 0x50, 0xAC, 0x3C, 0xFF, 0x03, 0x9A, 0x0F};
-constexpr uint32_t BATTERY_PREHEAT_PERIOD_MS = 1000UL;
+// Battery-preheat 0x082 UI_tripPlanning. byte0 carries the active/nav/request
+// bits; byte1..7 are route/context fields that vary between captures. Keep a
+// valid vehicle frame as the template and only override byte0.
+static const uint8_t BATTERY_PREHEAT_FALLBACK[8] = {0x01, 0x50, 0x91, 0x33, 0xFF, 0x03, 0xEE, 0x04};
+constexpr uint32_t BATTERY_PREHEAT_PERIOD_MS = 200UL;
+static uint8_t batteryPreheatTemplate[8] = {0x01, 0x50, 0x91, 0x33, 0xFF, 0x03, 0xEE, 0x04};
+static bool batteryPreheatTemplateValid = false;
 static uint8_t batteryPreheatOffFramesLeft = 0;
+static uint32_t batteryPreheatLastRxMs = 0;
+static uint32_t bmsTempLastRxMs = 0;
+
+static int8_t signedByte(uint8_t raw) {
+  return raw >= 0x80 ? static_cast<int8_t>(static_cast<int>(raw) - 256) : static_cast<int8_t>(raw);
+}
+
+static void formatPayload8(const can_frame& frame, char out[24]) {
+  static const char hex[] = "0123456789ABCDEF";
+  uint8_t pos = 0;
+  const uint8_t n = frame.can_dlc < 8 ? frame.can_dlc : 8;
+  for (uint8_t i = 0; i < n; ++i) {
+    if (i != 0) out[pos++] = ' ';
+    out[pos++] = hex[(frame.data[i] >> 4) & 0x0F];
+    out[pos++] = hex[frame.data[i] & 0x0F];
+  }
+  out[pos] = '\0';
+}
+
+static bool isUsableBatteryPreheatContext(const can_frame& frame) {
+  if (frame.can_dlc < 8) return false;
+  const uint16_t energyRaw = (static_cast<uint16_t>(frame.data[7]) << 8) | frame.data[6];
+  return frame.data[1] != 0x7F &&
+         frame.data[2] != 0xFF &&
+         frame.data[3] != 0x80 &&
+         energyRaw != 0x8000;
+}
+
+static void cacheBatteryPreheatTemplate(const can_frame& frame) {
+  batteryPreheatLastRxMs = millis();
+  g_status.batteryPreheatVehicleSeen = 1;
+  g_status.batteryPreheatUiTripActive = frame.data[0] & 0x01;
+  g_status.batteryPreheatUiNavToSupercharger = (frame.data[0] >> 1) & 0x01;
+  g_status.batteryPreheatUiFastChargerType = (frame.data[0] >> 2) & 0x07;
+  g_status.batteryPreheatUiState = (frame.data[0] >> 5) & 0x03;
+  g_status.batteryPreheatUiRequestHeat = (frame.data[0] >> 7) & 0x01;
+  g_status.batteryPreheatUiPowerW = frame.data[1] == 0x7F ? -32768 : static_cast<int>(signedByte(frame.data[1])) * 125;
+  g_status.batteryPreheatUiTargetCx100 = frame.data[2] == 0xFF ? -32768 : static_cast<int>(frame.data[2]) * 25;
+  g_status.batteryPreheatUiAmbientCx100 = frame.data[3] == 0x80 ? -32768 : static_cast<int>(signedByte(frame.data[3])) * 50;
+  if (!isUsableBatteryPreheatContext(frame)) return;
+  memcpy(batteryPreheatTemplate, frame.data, 8);
+  batteryPreheatTemplate[0] = 0x01;
+  batteryPreheatTemplateValid = true;
+  g_status.batteryPreheatTemplateValid = 1;
+}
+
+static void makeBatteryPreheatPayload(uint8_t payload[8], bool enabled) {
+  memcpy(payload,
+         batteryPreheatTemplateValid ? batteryPreheatTemplate : BATTERY_PREHEAT_FALLBACK,
+         8);
+  payload[0] = enabled ? 0xAF : 0x01;
+}
 
 static void sendBatteryPreheatFrame(const uint8_t payload[8]) {
   can_frame f = {};
@@ -523,7 +599,9 @@ static void serviceBatteryPreheat(const RuntimeConfig& cfg) {
       if (batteryPreheatLastSendMs == 0 ||
           (now - batteryPreheatLastSendMs) >= BATTERY_PREHEAT_PERIOD_MS) {
         batteryPreheatLastSendMs = now;
-        sendBatteryPreheatFrame(BATTERY_PREHEAT_OFF);
+        uint8_t payload[8];
+        makeBatteryPreheatPayload(payload, false);
+        sendBatteryPreheatFrame(payload);
         batteryPreheatOffFramesLeft--;
       }
     } else {
@@ -539,7 +617,9 @@ static void serviceBatteryPreheat(const RuntimeConfig& cfg) {
     return;
   }
   batteryPreheatLastSendMs = now;
-  sendBatteryPreheatFrame(BATTERY_PREHEAT_ON);
+  uint8_t payload[8];
+  makeBatteryPreheatPayload(payload, true);
+  sendBatteryPreheatFrame(payload);
 }
 
 // CAN A 璋冭瘯瑕佺偣锛?// TWAI 纭欢杩囨护鍙仛鈥滅矖杩囨护鈥濓紝鍑忓皯鎬荤嚎甯ц繘鍏?RX 闃熷垪鐨勬暟閲忥紱
@@ -1339,6 +1419,20 @@ static bool readSignedBitsLE(const can_frame& frame, uint8_t startBit, uint8_t l
   return true;
 }
 
+static void handleBatteryTempDiagFrame(const can_frame& frame, uint8_t bus) {
+  if (frame.can_id != CAN_ID_BMS_THERMAL_STATUS &&
+      frame.can_id != CAN_ID_BMS_PACK_TEMPERATURES &&
+      frame.can_id != CAN_ID_BMS_LOG1) {
+    return;
+  }
+  bmsTempLastRxMs = millis();
+  g_status.bmsTempFrameSeen = 1;
+  g_status.bmsTempFrameId = frame.can_id;
+  g_status.bmsTempFrameBus = bus;
+  g_status.bmsTempFrameMux = frame.can_dlc > 0 ? static_cast<uint8_t>(frame.data[0] & 0x0F) : 0;
+  formatPayload8(frame, g_status.bmsTempFramePayload);
+}
+
 static void handleRearFogDecelAccel(float accel, const RuntimeConfig& cfg) {
   const uint32_t now = millis();
   if (!canbReady || !cfg.canbEnabled || !cfg.rearFogBrakeStrobeEnabled) {
@@ -1754,6 +1848,12 @@ static void handleCanBFrame(const can_frame& frame) {
     handleRearFogBrakeLampState(brakeActive, cfg);
   }
 
+  if (frame.can_id == CAN_ID_UI_TRIP_PLANNING && frame.can_dlc >= 8) {
+    cacheBatteryPreheatTemplate(frame);
+  }
+
+  handleBatteryTempDiagFrame(frame, 2);
+
   if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
     handleVcleftSwitchFrame(frame, configSnapshot(), true);
     return;
@@ -1882,9 +1982,12 @@ static void handleStatus() {
   // Read-only: snapshot the cached config + status, never touch the CAN bus.
   RuntimeConfig c = configSnapshot();
   RuntimeStatus s = g_status;
+  const uint32_t now = millis();
+  s.batteryPreheatVehicleAgeMs = batteryPreheatLastRxMs == 0 ? 0 : (now - batteryPreheatLastRxMs);
+  s.bmsTempFrameAgeMs = bmsTempLastRxMs == 0 ? 0 : (now - bmsTempLastRxMs);
 
   String j;
-  j.reserve(1500);
+  j.reserve(2400);
   j += '{';
   j += "\"fsdEnabled\":";            j += c.fsdEnabled ? 1 : 0;
   j += ",\"autoSpeedOffsetEnabled\":"; j += c.autoSpeedOffsetEnabled ? 1 : 0;
@@ -1935,6 +2038,23 @@ static void handleStatus() {
   j += ",\"reverseStrobeActive\":"; j += s.reverseStrobeActive;
   j += ",\"reverseStrobeRemaining\":"; j += s.reverseStrobeRemaining;
   j += ",\"batteryPreheatActive\":"; j += s.batteryPreheatActive;
+  j += ",\"batteryPreheatVehicleSeen\":"; j += s.batteryPreheatVehicleSeen;
+  j += ",\"batteryPreheatTemplateValid\":"; j += s.batteryPreheatTemplateValid;
+  j += ",\"batteryPreheatUiTripActive\":"; j += s.batteryPreheatUiTripActive;
+  j += ",\"batteryPreheatUiNavToSupercharger\":"; j += s.batteryPreheatUiNavToSupercharger;
+  j += ",\"batteryPreheatUiFastChargerType\":"; j += s.batteryPreheatUiFastChargerType;
+  j += ",\"batteryPreheatUiState\":"; j += s.batteryPreheatUiState;
+  j += ",\"batteryPreheatUiRequestHeat\":"; j += s.batteryPreheatUiRequestHeat;
+  j += ",\"batteryPreheatUiPowerW\":"; j += s.batteryPreheatUiPowerW;
+  j += ",\"batteryPreheatUiTargetCx100\":"; j += s.batteryPreheatUiTargetCx100;
+  j += ",\"batteryPreheatUiAmbientCx100\":"; j += s.batteryPreheatUiAmbientCx100;
+  j += ",\"batteryPreheatVehicleAgeMs\":"; j += s.batteryPreheatVehicleAgeMs;
+  j += ",\"bmsTempFrameSeen\":"; j += s.bmsTempFrameSeen;
+  j += ",\"bmsTempFrameId\":"; j += s.bmsTempFrameId;
+  j += ",\"bmsTempFrameBus\":"; j += s.bmsTempFrameBus;
+  j += ",\"bmsTempFrameMux\":"; j += s.bmsTempFrameMux;
+  j += ",\"bmsTempFrameAgeMs\":"; j += s.bmsTempFrameAgeMs;
+  j += ",\"bmsTempFramePayload\":\""; j += s.bmsTempFramePayload; j += '"';
   j += ",\"rightScrollTicks\":";     j += s.rightScrollTicks;
   j += ",\"rightStalkStatus\":";     j += s.rightStalkStatus;
   j += ",\"rightStalkCounter\":";    j += s.rightStalkCounter;
@@ -2382,6 +2502,7 @@ void loop() {
     didWork = true;
     digitalWrite(PIN_LED, LOW);
     recordCanFrame(frame, 'R', 1);
+    handleBatteryTempDiagFrame(frame, 1);
     RuntimeConfig cfg = configSnapshot();
     speedLimitMonitor.update(frame);
     handler.refreshUnifiedSpeedCompensation(cfg);
