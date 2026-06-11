@@ -1,10 +1,10 @@
-﻿# ESP32-FSD / ESP32-FSD
+# T-2CAN-WEB
 
 **Language / 语言:** [English](#english) · [中文](#中文)
 
 > **Safety disclaimer / 安全免责声明**
-> This firmware modifies CAN messages related to vehicle driver-assistance behavior. It is provided for research and educational use only. You are responsible for legality, safety, validation, and all consequences of using it on real hardware.
-> 本固件会修改与车辆驾驶辅助相关的 CAN 报文，仅供研究和学习使用。实际使用前请自行承担合规、安全、验证及全部后果。
+> This firmware modifies and injects vehicle CAN messages. It is provided for research and educational use only. You are responsible for legality, safety validation, installation quality, and all consequences of using it on real hardware.
+> 本固件会修改和发送车辆 CAN 报文，仅供研究和学习使用。实际使用前请自行承担合规、安全验证、安装质量及全部后果。
 
 ---
 
@@ -12,348 +12,232 @@
 
 ### Overview
 
-`ESP32-FSD` is the enhanced ESP32-S3 TWAI branch for Waveshare ESP32-S3-RS485-CAN. It is CAN-only and HW3-only, but includes the full practical feature set currently considered useful: FSD activation, follow-distance speed profile control, fused-speed-limit based speed offset, PCT4 encoding, downward slew limiting, and TWAI reliability handling.
+`T-2CAN-WEB` is the LILYGO T-2CAN branch of this firmware. It keeps the Arduino / PlatformIO build and a bounded CAN fast path while adding:
 
-No WiFi, Bluetooth, OTA, Web UI, or dashboard runtime is initialized.
+- HW3 FSD activation and speed-limit offset on the primary TWAI bus.
+- A second MCP2515 CAN bus for body/lighting/preheat features.
+- A lightweight SoftAP WebUI for runtime switches, status, and PSRAM-based CSV capture.
 
-### Repository Architecture
+This README describes the current `T-2CAN-WEB` branch only. Older branch-generic notes were intentionally removed to avoid mixing incompatible wiring and build instructions.
 
-`main` documents the baseline single-CAN ESP32-S3 architecture. Other branches
-specialize this baseline for HW3/HW4, RP2040/MCP2515, LILYGO T-2CAN dual-CAN,
-WebUI, and experimental capture work.
+### Hardware Target
 
-| Layer | Component | Role |
-|-------|-----------|------|
-| CAN A / CAN1 | ESP32-S3 built-in TWAI | Single primary CAN interface on the baseline branch. It receives selected AP/FSD frames, applies the speed/profile edits, and transmits the modified frame. |
-| Main loop | Arduino `loop()` | Services TWAI alerts, drains the RX queue with ID/DLC validation, runs the frame handler, and keeps the LED/status behavior simple. |
-| Frame logic | HW3 FSD/speed-offset handler | Tracks follow-distance/profile state, reads fused speed limit, computes PCT4 speed offset, applies slew limiting, and writes `1021` mux fields. |
-| Branch family | ESP32 / RP2040 / T-2CAN branches | ESP32 branches use native TWAI; RP2040 branches use MCP2515 over SPI; T-2CAN branches add a second MCP2515 CAN bus and optional WebUI/PSRAM recorder. |
-| Configuration | PlatformIO build flags | Pins, queue lengths, board targets, and optional feature flags are selected per branch/environment. |
+- Board: LILYGO T-2CAN, ESP32-S3 N16R8 class hardware.
+- Framework: Arduino via PlatformIO.
+- CAN bitrate: 500 kbps on both buses.
+- Flash: 16 MB.
+- WebUI build uses OPI PSRAM for the recorder buffer.
 
-### Project Architecture
+### Bus Mapping
 
-This branch is an Arduino / PlatformIO ESP32-S3 firmware. The primary firmware
-entry point is `ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`; the optional lightweight
-WebUI is kept in `ESP32S3CAN-FSD/web_ui_page.h` so the CAN fast path remains
-simple.
+LILYGO's physical connector names are easy to confuse with older project text. In this branch, use the mapping below:
 
-| Layer | Component | Role |
-|-------|-----------|------|
-| bus=1 / TWAI / physical CANB | ESP32-S3 built-in TWAI | Primary FSD/speed-control bus. Reads speed-limit, brake/deceleration, gear, and AP-control context; transmits modified FSD/control frames when enabled. |
-| bus=2 / MCP2515 / physical CANA | MCP2515 over SPI, only on LILYGO T-2CAN builds | Auxiliary body/lighting bus for flash-to-pass strobe, rear fog strobe, reverse hazard trigger, lighting feedback, right-scroll detection, battery preheat, and recorder context. |
-| Main loop | Arduino `loop()` | Runs the bounded CAN fast path, services TWAI alerts, drains MCP2515 with a budget, and advances non-blocking strobe/preheat state machines. |
-| WebUI task | FreeRTOS task on core 0 | Optional SoftAP control/status page. It only reads cached status and updates config; CAN work remains in the main loop. |
-| Capture | PSRAM recorder | Stores binary CAN frames in PSRAM first, then streams CSV only after recording stops. No SPIFFS/LittleFS writes occur in the CAN fast path. |
+| Firmware bus | Controller | Official LILYGO physical port | Pins | Role |
+|---|---|---|---|---|
+| `bus=1` | ESP32-S3 native TWAI | physical `CANB` | TX `GPIO7`, RX `GPIO6` | Primary FSD activation and speed-control bus |
+| `bus=2` | MCP2515 over SPI | physical `CANA` | SCK `GPIO12`, MOSI `GPIO11`, MISO `GPIO13`, CS `GPIO10`, RST `GPIO9`, INT `GPIO8`, 16 MHz crystal | Auxiliary body/lighting/preheat/recorder bus |
 
-### Target Hardware
+Important: official LILYGO T-2CAN V1.0 names physical `CANA` as MCP2515/SPI and physical `CANB` as native TWAI. This README uses the official physical names plus the firmware `bus=1` / `bus=2` labels.
 
-- Board: Waveshare ESP32-S3-RS485-CAN
-- Framework: Arduino via PlatformIO
-- CAN controller: ESP32-S3 built-in TWAI
-- CAN bitrate: 500 kbps
-- Flash target: 16 MB
-- Partition table: `huge_app.csv`
-- Default TWAI TX: GPIO15
-- Default TWAI RX: GPIO16
-- LED: GPIO14
-- RX queue length: 64
-- TX queue length: 16
+### Architecture
 
-### CAN Functions
+| Layer | Component | Behavior |
+|---|---|---|
+| Main loop | Arduino `loop()` | Services TWAI alerts, handles one primary TWAI frame, drains MCP2515 with a bounded budget, and advances non-blocking feature state machines. |
+| Primary CAN | `bus=1` / TWAI / physical CANB | Handles FSD activation, speed profile, speed offset, brake/gear context, and TWAI recovery. |
+| Secondary CAN | `bus=2` / MCP2515 / physical CANA | Handles body/lighting/preheat/service-mode features and capture context. |
+| WebUI | Low-priority FreeRTOS task on core 0 | Serves the SoftAP page, reads cached status, updates runtime config, and never runs inside the CAN fast path. |
+| Recorder | PSRAM buffer | Stores binary CAN frames first; CSV is formatted only during HTTP download after recording stops. |
+
+No OTA, SPIFFS, LittleFS, arbitrary CAN-send page, cross-bus bridge, or MITM rewrite is included in this branch.
+
+### Primary FSD / Speed Control
+
+Primary bus: `bus=1` / TWAI / physical CANB.
 
 | CAN ID | Function | Behavior |
-|--------|----------|----------|
-| `1016` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
-| `1021 mux 0` | FSD/profile control | Sets bit `46`, writes `speedProfile` into `data[6] bit 1..2`, then transmits. |
-| `1021 mux 1` | Control/nag bit | Clears bit `19`, then transmits. |
-| `1021 mux 2` | Speed offset | Writes PCT4 speed-offset raw value after slew limiting. |
-| `0x399` | Fused speed limit | Reads `data[1] & 0x1F`; `0` and `31` are invalid; valid raw value is multiplied by `5 kph`. |
+|---|---|---|
+| `0x399` | Fused speed limit | Reads `data[1] & 0x1F`; raw `0` and `31` are invalid; valid value is `raw * 5 kph`. |
+| `1016` / `0x3F8` | Follow distance | Reads `data[5] bit 5..7` and updates `speedProfile`. |
+| `1021` / `0x3FD` mux 0 | FSD/profile control | Sets bit `46`, writes `speedProfile` into `data[6] bit 1..2`, then transmits. |
+| `1021` / `0x3FD` mux 1 | Control bit | Clears bit `19`, then transmits. |
+| `1021` / `0x3FD` mux 2 | Speed offset | Writes the computed PCT4 speed-offset raw value after downward slew limiting. |
 
-### Follow-Distance / Speed-Profile Mapping
+Follow-distance mapping:
 
-| Follow distance raw value from `1016` | Written `speedProfile` | Firmware effect |
-|---------------------------------------|------------------------|-----------------|
-| `1` | `2` | More aggressive profile |
-| `2` | `1` | Middle/default profile |
-| `3` | `0` | Softer profile |
-| Other values | unchanged | Keeps last profile |
+| Follow distance raw | Written `speedProfile` |
+|---|---|
+| `1` | `2` |
+| `2` | `1` |
+| `3` | `0` |
+| Other | unchanged |
 
-### FSD Activation Details
+### Speed Offset Logic
 
-On `1021 mux 0`:
+The default speed table is:
 
-- Sets bit `46` to enable the HW3 FSD/profile control path.
-- Writes current `speedProfile` into `data[6] bit 1..2`.
-- Sends the modified frame through TWAI.
+| Fused speed limit | Target / behavior |
+|---|---|
+| `< 50 kph` | direct PCT4 raw `200` (50%) |
+| `50..59 kph` | target `60 kph` |
+| `60..69 kph` | target `80 kph` |
+| `70..79 kph` | target `85 kph` |
+| `80..89 kph` | target `90 kph` |
+| `90..99 kph` | target `100 kph` |
+| `100..119 kph` | target `120 kph` |
+| `120..139 kph` | target `140 kph` |
+| `>= 140 kph` | no added offset |
 
-On `1021 mux 1`:
+Rules:
 
-- Clears bit `19`.
-- Sends the modified frame through TWAI.
-
-On `1021 mux 2`:
-
-- Uses the computed PCT4 speed offset if a valid fused speed limit is available.
-- If no valid fused speed limit is available, preserves the original stock speed-offset raw value from the frame.
-- Applies downward slew limiting before writing the raw value.
-
-### Speed Limit Reading
-
-`0x399` fused speed limit parsing:
-
-- Source field: `data[1] & 0x1F`.
-- Invalid raw values: `0` and `31`.
-- Effective limit: `raw * 5 kph`.
-- Valid effective range from this parser: `5..150 kph`.
-
-### Target-Speed Table
-
-| Fused speed limit | Target speed | Maximum desired boost before clamp |
-|-------------------|--------------|------------------------------------|
-| `< 50 kph` | capped `50%` | raw `200` |
-| `50..59 kph` | `60 kph` | `60 - limit` |
-| `60..69 kph` | `80 kph` | `80 - limit` |
-| `70..79 kph` | `85 kph` | `85 - limit` |
-| `80..89 kph` | `90 kph` | `90 - limit` |
-| `90..99 kph` | `100 kph` | `100 - limit` |
-| `100..119 kph` | `120 kph` | `120 - limit` |
-| `120..139 kph` | `140 kph` | `140 - limit` |
-| `>= 140 kph` | same as limit | `0 kph` |
-
-### Speed Offset Rules
-
-- Desired offset: `targetSpeedKph - fusedSpeedLimitKph`.
-- Absolute offset pre-clamp: `0..25 kph`.
-- PCT4 percentage cap: `50%`.
-- PCT4 raw formula: `raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`.
-- Final raw range used by the algorithm: `0..200`.
-- Raw is written into `1021 mux 2` using `data[0] bit 6..7` and `data[1] bit 0..5`.
-
-Examples with the default table:
-
-| Fused limit | Target | Offset after clamp | Percent | PCT4 raw |
-|-------------|--------|--------------------|---------|----------|
-| `30 kph` | `60 kph` | `25 kph` | capped to `50%` | `200` |
-| `45 kph` | capped `50%` | n/a | `50%` | `200` |
-| `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
-| `55 kph` | `60 kph` | `5 kph` | `9%` | `36` |
-| `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
-| `70 kph` | `85 kph` | `15 kph` | `21%` | `84` |
-| `75 kph` | `85 kph` | `10 kph` | `13%` | `52` |
-| `80 kph` | `90 kph` | `10 kph` | `13%` | `52` |
-| `90 kph` | `100 kph` | `10 kph` | `11%` | `44` |
-| `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
-| `120 kph` | `140 kph` | `20 kph` | `17%` | `68` |
-| `140 kph+` | same as limit | `0 kph` | `0%` | `0` |
-
-### Slew Limiter
-
-The slew limiter only limits downward raw changes, because sudden loss of offset can feel like sudden deceleration.
-
-- Default downward limit: `5%/s`.
-- PCT4 raw rate: `5 * 4 = 20 raw units/s`.
+- Desired offset is `targetSpeedKph - fusedSpeedLimitKph`.
+- Absolute pre-clamp is `0..25 kph`.
+- PCT4 wire encoding is `raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`.
+- PCT4 cap is 50%, so max raw is `200`.
+- Downward slew limit defaults to `5%/s`.
 - Rising offset changes pass immediately.
-- If fused speed limit suddenly drops and target raw goes lower, the firmware ramps downward instead of jumping directly.
+- If no valid fused speed limit exists, the firmware preserves the stock speed-offset raw from the incoming frame.
 
-### CAN Reliability Features
+### Reliability Features
 
-- TWAI alerts enabled:
-  - bus-off
-  - bus recovered
-  - recovery in progress
-  - error passive
-  - bus error
-  - TX failed
-  - RX queue full
-  - RX FIFO overrun
-- Bus-off is detected and automatic recovery is initiated.
-- TWAI is restarted after recovery.
-- TX failure short retry: `1` retry after `1 ms`.
-- TX wait timeout: `5 ms`.
-- RX wait timeout: `1 ms`.
-- RX scan limit: `8` frames per loop pass.
-- DLC protection for all parsed frames.
-- Rejects extended frames, remote frames, and over-length frames.
-- Hardware acceptance filter: coarse 16-ID pass set around `0x399`, `1016`, and `1021`.
-- Software exact filter: only `0x399`, `1016`, and `1021` are processed.
+- TWAI alert handling.
+- Bus-off detection and automatic recovery.
+- Short TX retry with bounded timeout.
+- DLC length protection.
+- Hardware and software filtering on the primary CAN IDs.
+- Optional `bus=1` receive-only mode from WebUI, which blocks TWAI TX only.
 
-### Build & Flash
+### Secondary CAN Features
 
-```bash
-pio run -e waveshare_ESP32_S3_RS485_CAN
-pio run -e waveshare_ESP32_S3_RS485_CAN -t upload
-```
+Secondary bus: `bus=2` / MCP2515 / physical CANA.
 
-Erase then flash:
+- MCP2515 starts after TWAI. If MCP2515 init fails, primary FSD/speed control continues.
+- Normal drain budget: up to 4 frames per loop.
+- When MCP2515 INT `GPIO8` is asserted or recorder is active: up to 24 frames with a 900 us time cap.
+- Hardware filter modes:
+  - `0`: receive all standard frames for debugging.
+  - `1`: feature IDs.
+  - `2`: minimum runtime IDs.
+- Feature/minimum filters include `0x082` and `0x339` so battery-preheat monitoring and VCSEC lock-status detection are not lost.
 
-```bash
-pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_flash
-pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
-```
+Implemented `bus=2` features:
 
-### LILYGO T-2CAN (dual CAN)
+- **Service mode (`0x339`)**: WebUI switch queues a 4-frame burst at 10 ms spacing. Enable frame is `00 00 00 00 00 80 00 00`; disable frame clears byte 5.
+- **Flash-to-pass strobe (`0x249`)**: when armed, two pull events within 1.2 s trigger 8 PULL/idle pulses. Default cadence is 75 ms ON / 75 ms OFF.
+- **Rear-fog deceleration strobe (`0x273`)**: when armed, mild deceleration triggers 3 pulses and hard deceleration triggers 5 pulses. Cadence is 500 ms.
+- **Reverse hazard + rear-fog strobe**: when armed, reverse gear on `bus=1` `0x118`, or brake + right-scroll back on `bus=2` `0x3C2`, triggers hazard and rear-fog pulses.
+- **Scroll gear injection (`0x229`)**: experimental, default off. With brake pressed, right-scroll back requests R and right-scroll forward requests D.
+- **Battery preheat (`0x082`)**: when enabled, sends dynamic `UI_tripPlanning` on `bus=2` every 200 ms.
+- **Lock-triggered deep sleep**: when enabled, detects validated lock signals on `0x273` or `0x339`, inhibits all CAN TX, shuts down WiFi/TWAI, and enters ESP32 deep sleep.
 
-The `T-2CAN` branch also targets the **LILYGO T-2CAN** board, which exposes two
-CAN buses. It stays on the Arduino/PlatformIO framework and the same single fast
-`loop()`. The firmware keeps the historical CSV labels `bus=1` and `bus=2`,
-but the WebUI/CSV/README now also show the official LILYGO physical connector
-names to avoid wiring ambiguity.
+### Battery Preheat Details
 
-| CSV bus | Controller | Official LILYGO connector | Pins | Role |
-|---------|------------|---------------------------|------|------|
-| `bus=1` | ESP32-S3 native TWAI | physical `CANB` | TX `GPIO7`, RX `GPIO6` | FSD activation + speed-limit modification |
-| `bus=2` | MCP2515 over SPI | physical `CANA` | SCK `GPIO12`, MOSI `GPIO11`, MISO `GPIO13`, CS `GPIO10`, RST `GPIO9`, INT `GPIO8`, 16 MHz xtal | Body/lighting/right-stalk/preheat/recorder context |
+The firmware caches the latest valid vehicle `0x082` context (`byte1..7`) and only overrides `byte0`.
 
-Important mapping: official LILYGO T-2CAN V1.0 names **physical CANA as
-MCP2515/SPI** and **physical CANB as native TWAI**. Older project text used
-"CAN A" to mean TWAI and "CAN B" to mean MCP2515; that is reversed relative to
-the board silk screen.
+- Current fallback/context bytes: `01 50 AC 32 FF 03 61 15`.
+- WebUI ON frame becomes: `AF 50 AC 32 FF 03 61 15`.
+- WebUI OFF uses byte0 `0x01` and sends several OFF frames before stopping.
 
-- All pins come from PlatformIO `build_flags` (`-DTWAI_*`, `-DMCP2515_*`); no
-  LilyGO pin is hard-coded in the firmware.
-- bus=1/TWAI/physical CANB keeps every existing feature: `0x399` fused-limit read, `1016` follow
-  distance, `1021 mux0/1/2` FSD activation / bit-19 clear / PCT4 speed offset,
-  the full target-speed table, `5%/s` downward slew, TWAI alerts, bus-off
-  auto-recovery, TX short retry, DLC protection, and the RX filter.
-- MCP2515 is initialized after TWAI. If it is missing or fails to init it stays
-  disabled and never blocks or disturbs bus=1/TWAI/FSD. Normal loop drain is 4
-  RX frames; when MCP2515 INT `GPIO8` is asserted or the recorder is active it
-  drains up to 24 frames with a 900 us time cap.
-- **MCP2515 hardware filter**: WebUI exposes three modes:
-  `0` receive all standard frames for debug, `1` feature IDs, and `2` minimum
-  runtime IDs. Feature/minimum filters include `0x082` and `0x339` so
-  battery-preheat monitoring and VCSEC lock-status detection are not lost when
-  filtering is enabled.
-- **MCP2515/physical CANA service mode (`0x339`)**: off by default. Toggling it queues a 4-frame
-  burst at 10 ms spacing (`millis()`-scheduled, never `delay()`), sent only on
-  bus=2/MCP2515/physical CANA (`00 00 00 00 00 80 00 00` to enter, `…00 00` to exit).
-- **Flash-to-pass strobe (`0x249`)**: when armed from the WebUI, two
-  flash-to-pass lever pulls within 1.2 seconds trigger 8 pulses. The firmware
-  sends `status=1` PULL and `status=0` idle on bus=2/MCP2515/physical CANA, defaulting to 75 ms ON /
-  75 ms OFF. It forces idle at the end and uses `0x3F5` only for feedback.
-- **Rear-fog deceleration strobe**: when armed from the WebUI, mild deceleration
-  triggers 3 rear-fog pulses and hard deceleration triggers 6 pulses. The main
-  deceleration source is `0x111/0x116 RCM_inertial2` longitudinal acceleration;
-  `0x145` ESP brake state, `0x273` brake-light state, `0x148` brake-torque
-  request, `0x185` wheel brake torque, `0x118` regen/vehicle acceleration,
-  `0x186` negative torque, and `0x257` falling speed are used as confirmation.
-  Output reuses the latest live `0x273` frame when available and only toggles
-  `data[2] bit7` (`0x80`) so unrelated cabin/lighting bits are not overwritten.
-- **Reverse-gear hazard + rear-fog strobe**: when armed from the WebUI it arms
-  on two trigger sources: (a) the rising edge of `DI_gear = 2` (`R`) on bus=1/TWAI/physical CANB
-  `0x118` (`DI_systemStatus`), and (b) **brake pressed + right-scroll back** —
-  `VCLEFT_swcRightScrollTicks < 0` on bus=2/MCP2515/physical CANA `0x3C2` (`VCLEFT_switchStatus`,
-  `data[3] bits0..5`, 6-bit signed) while the brake is applied. Brake +
-  scroll-forward (`> 0`) is treated as D intent and cancels the strobe. On
-  trigger it pulses the hazard button on bus=2/MCP2515/physical CANA `0x3C2` (`byte0 bit3` =
-  `VCLEFT_hazardButtonPressed`) — 4 flashes at **0.5 s on / 0.5 s off**, reusing
-  the latest live `0x3C2` mux0 frame — plus rear fog on bus=2/MCP2515/physical CANA `0x273`. The real
-  D/R gear command (`0x109 SBW_RQ_SCCM`) is **not** injected — its CRC is unknown
-  and the frame was not seen on either tapped bus — so this stays a trigger-only
-  feature. The hazard-button pulse/cadence still needs on-vehicle validation.
-- **Battery preheat trigger (`0x082`)**: when enabled from the WebUI, the
-  T-2CAN build sends `0x082` (`UI_tripPlanning`) on `bus=2/MCP2515/physical
-  CANA` every 200 ms. It caches the latest valid vehicle `0x082` context
-  fields (`byte1..7`) and only overrides `byte0` to ON (`0xAF`) or OFF
-  (`0x01`). This follows the latest captures where route context fields vary
-  between sessions and the vehicle can continue broadcasting inactive `0x082`
-  frames while the injected request is active. Latest validated context from
-  captures 93/94/95 is `01 50 AC 32 FF 03 61 15`; WebUI ON becomes
-  `AF 50 AC 32 FF 03 61 15`.
-- **Battery preheat diagnostics**: the WebUI status panel decodes the latest
-  vehicle `0x082` request/state bits, target temperature, destination ambient
-  temperature, power request, charge target, and energy-at-destination raw
-  value. It also passively watches BMS temperature candidate frames (`0x312`,
-  `0x712`, `0x374`) on both buses and shows the last seen bus, ID, mux, age,
-  and raw payload. Those BMS frames are not part of the current feature/minimum
-  MCP2515 hardware-filter set; set the WebUI hardware filter to receive-all
-  before testing this diagnostic.
-- **Lock-triggered deep sleep**: when enabled from the WebUI, the T-2CAN build
-  only references vehicle lock signals from bus=2/MCP2515/physical CANA:
-  `0x273` lock request (`lockRequest` values `1` or `4`) and `0x339` VCSEC lock
-  status. On a validated lock signal the firmware inhibits all CAN TX, stops
-  normal work, turns WiFi off, stops TWAI, and enters ESP32 deep sleep. No
-  seat/EPAS/timeout sleep heuristic is imported. With USB vehicle power, the
-  intended wake path is vehicle USB power returning and the board cold-booting.
-- **CAN recorder**: the WebUI build includes a lightweight dual-bus CSV recorder.
-  It supports include filters (`ids=`), optional excludes, status polling, stop,
-  and download. The recorder stores binary frames first and only formats CSV
-  during download. CSV output includes `controller` and `physical` columns, so
-  `bus=1` is explicit as `TWAI/physical CANB` and `bus=2` as
-  `MCP2515/physical CANA`. CSV download is served as chunked HTTP output and is
-  only available after recording has stopped.
-- **PSRAM capture buffer**: the WebUI build enables OPI PSRAM and allocates the
-  recorder buffer from PSRAM. Default capacity is `100000` frames, roughly
-  2.4 MB. It does not write SPIFFS/LittleFS/Flash in the CAN fast path.
+WebUI diagnostics decode:
 
-Deferred on this branch (not migrated): arbitrary WebUI CAN send, cross-bus
-bridging, MITM rewriting, and Flash-backed persistent capture files.
+- request/state bits,
+- power request,
+- target temperature,
+- destination ambient temperature,
+- charge target,
+- raw energy-at-destination value,
+- BMS temperature candidate frames `0x312`, `0x712`, and `0x374`.
 
-### Light WebUI (optional)
+Set MCP2515 hardware filter to receive-all when testing BMS temperature diagnostics, because those BMS candidate IDs are not in the feature/minimum filter set.
 
-A minimal SoftAP parameter page can be compiled in with `-DENABLE_LIGHT_WEBUI`
-(the `lilygo_t2can_arduino_webui` env). It is intentionally isolated so it never
-touches the CAN fast path:
+### Lock Deep Sleep
 
-- SoftAP `T2CAN-FSD` / pass `12345678`; page at **`http://100.100.1.1`**
-  (set via `softAPConfig`).
-- Runs on its own low-priority FreeRTOS task pinned to **core 0**; the CAN
-  `loop()` never waits on HTTP.
-- Endpoints: `GET /`, `GET /status`, `POST /config`, `POST /save`,
-  `POST /test`, `POST /rec_start`, `POST /rec_stop`, `GET /rec_status`,
-  `GET /rec_download`, `POST /web/off`.
-- `/status` only reads a cached status/config snapshot (never triggers CAN);
-  `/config` updates RAM only; `/save` is the only path that writes Flash
-  (`Preferences`).
-- The page **does not poll by default** — polling is opt-in and runs at most once
-  per second; closing the WebUI stops all requests and shuts the SoftAP down.
-- The flash-to-pass strobe switch is an arm/disarm control. When enabled, pull
-  the flash-to-pass lever twice to trigger one 8-pulse burst; the switch can
-  stay on for later double-pull triggers.
-- The rear-fog strobe switch is an arm/disarm control. Mild deceleration
-  triggers 3 pulses; hard deceleration triggers 6 pulses. `0x145` and `0x273`
-  are confirmation inputs, not direct one-frame triggers.
-- Clearing the recorder ID field disables only the recorder-layer filter.
-  bus=1/TWAI still records firmware-relevant FSD/chassis IDs; bus=2/MCP2515 can
-  be broad when the MCP2515 hardware filter is disabled. For unknown
-  wheel-button IDs, disable the MCP2515 hardware filter before recording.
-- No OTA and no SPIFFS/LittleFS file capture. Capture uses PSRAM and downloads
-  as CSV after recording is stopped.
+When enabled from WebUI, lock sleep only references `bus=2` / MCP2515 / physical CANA:
 
-### Build & Flash (LILYGO T-2CAN)
+- `0x273` lock request values `1` or `4`.
+- `0x339` VCSEC lock status.
 
-```bash
+On a validated lock signal:
+
+- all CAN TX is inhibited,
+- active strobe/preheat/gear state is cleared,
+- WiFi is disabled,
+- TWAI is stopped and uninstalled,
+- ESP32 enters deep sleep.
+
+No seat, EPAS, or generic timeout sleep heuristic is included. In the intended vehicle USB-power installation, the board wakes by cold-booting when USB power returns.
+
+### WebUI
+
+Build environment: `lilygo_t2can_arduino_webui`.
+
+- SoftAP IP/gateway: `100.100.1.1`.
+- Web task runs on core 0 at low priority.
+- The CAN fast path does not call `server.handleClient()`.
+- Page polling is user-controlled and limited to 1 second intervals.
+- Closing WebUI stops requests and shuts the SoftAP down.
+- Runtime config changes apply in RAM; persistent settings are written only when Save is pressed.
+- No OTA page is included.
+
+The WebUI exposes:
+
+- FSD enable,
+- auto speed-offset enable,
+- speed table and slew setting,
+- CANB enable,
+- CANB filter mode,
+- service mode,
+- lighting/strobe features,
+- scroll gear injection,
+- battery preheat,
+- lock deep sleep,
+- receive-only TWAI mode,
+- status counters,
+- PSRAM recorder controls.
+
+### Recorder
+
+The WebUI build includes a lightweight dual-bus CSV recorder:
+
+- stores binary frames in PSRAM first,
+- supports include filters and excludes,
+- records both bus directions and physical/controller labels,
+- formats and streams CSV only when downloading after recording stops,
+- does not write SPIFFS/LittleFS in the CAN fast path.
+
+CSV labels:
+
+- `bus=1`: `TWAI`, physical `CANB`.
+- `bus=2`: `MCP2515`, physical `CANA`.
+
+### Build And Upload
+
+Non-WebUI LILYGO build:
+
+```powershell
 pio run -e lilygo_t2can_arduino
 pio run -e lilygo_t2can_arduino -t upload --upload-port COMx
 ```
 
-WebUI build:
+WebUI LILYGO build:
 
-```bash
+```powershell
 pio run -e lilygo_t2can_arduino_webui
+pio run -e lilygo_t2can_arduino_webui -t upload --upload-port COMx
 ```
 
-The WebUI build enables LILYGO T-2CAN OPI PSRAM:
+Recent verified upload example:
 
-```text
-board_build.arduino.memory_type = qio_opi
--DBOARD_HAS_PSRAM
--DREC_CAP=100000
+```powershell
+pio run -e lilygo_t2can_arduino_webui -t upload --upload-port COM23
 ```
 
-### Full 16 MB BIN
+### Files
 
-This branch can generate a full merged 16 MB image for flashing from offset `0x0`. A typical local output path is:
-
-```text
-release/ESP32-FSD/ESP32-FSD-waveshare-full-16MB.bin
-```
-
-The 16 MB full image is convenient for complete factory-style flashing. Normal PlatformIO upload is still fine for development.
-
-### When To Use
-
-Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FSD activation, speed-limit-aware speed offset, DEV-compatible PCT4 default encoding, downward slew protection, and TWAI stability handling.
+- Firmware: `ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`
+- WebUI page: `ESP32S3CAN-FSD/web_ui_page.h`
+- Build config: `platformio.ini`
+- Work log: `WORK_SUMMARY.md`
 
 ---
 
@@ -361,317 +245,229 @@ Use this branch when you want the most capable current ESP32-S3 firmware: HW3 FS
 
 ### 概述
 
-`ESP32-FSD` 是面向 Waveshare ESP32-S3-RS485-CAN 的增强版 ESP32-S3 TWAI 分支。它是纯 CAN、仅 HW3 的固件，但包含目前最有实际价值的一套功能：FSD 激活、跟车距离速度档控制、基于融合限速的速度偏移、PCT4 编码、下降 slew 限幅，以及 TWAI 稳定性处理。
+`T-2CAN-WEB` 是面向 LILYGO T-2CAN 的分支。它保持 Arduino / PlatformIO 框架和有预算限制的 CAN 快速处理路径，同时加入：
 
-不会初始化 WiFi、蓝牙、OTA、Web UI 或 Dashboard 运行逻辑。
+- 主 TWAI 总线上的 HW3 FSD 激活与限速偏移。
+- 第二路 MCP2515 CAN，用于车身、灯光、预热等辅助功能。
+- 轻量 SoftAP WebUI，用于运行期开关、状态查看和基于 PSRAM 的 CSV 抓包。
 
-### 仓库架构
-
-`main` 说明基线单 CAN ESP32-S3 架构。其它分支在此基础上分别面向
-HW3/HW4、RP2040/MCP2515、LILYGO T-2CAN 双 CAN、WebUI 和实验抓包。
-
-| 层级 | 组件 | 作用 |
-|------|------|------|
-| CAN A / CAN1 | ESP32-S3 原生 TWAI | 基线分支的唯一主 CAN 接口。接收选定 AP/FSD 帧，应用速度/档位修改，再发送修改后的帧。 |
-| 主循环 | Arduino `loop()` | 处理 TWAI alert，带 ID/DLC 校验地读取 RX 队列，运行帧处理器，并保持 LED/状态逻辑简单。 |
-| 帧逻辑 | HW3 FSD/速度偏移处理器 | 保存跟车距离/速度档状态，读取融合限速，计算 PCT4 速度偏移，应用 slew 限幅，并写入 `1021` mux 字段。 |
-| 分支族 | ESP32 / RP2040 / T-2CAN 分支 | ESP32 分支使用原生 TWAI；RP2040 分支使用 MCP2515 SPI；T-2CAN 分支增加第二路 MCP2515 CAN 与可选 WebUI/PSRAM 抓包器。 |
-| 配置 | PlatformIO build flags | 引脚、队列长度、板型目标和可选功能开关按分支/环境选择。 |
-
-### 项目架构
-
-本分支是 Arduino / PlatformIO 架构的 ESP32-S3 固件。主固件入口是
-`ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`；可选轻量 WebUI 放在
-`ESP32S3CAN-FSD/web_ui_page.h`，避免页面字符串干扰 CAN 快路径。
-
-| 层级 | 组件 | 作用 |
-|------|------|------|
-| bus=1 / TWAI / 物理 CANB | ESP32-S3 原生 TWAI | 主 FSD/速度控制总线。读取限速、刹车/减速、档位、AP 控制上下文；启用时发送修改后的 FSD/控制帧。 |
-| bus=2 / MCP2515 / 物理 CANA | MCP2515 SPI，仅 LILYGO T-2CAN 构建使用 | 辅助车身/灯光总线，用于高光爆闪、后雾灯爆闪、倒车双闪触发、灯态反馈、右滚轮识别、电池预热和抓包上下文。 |
-| 主循环 | Arduino `loop()` | 运行有预算限制的 CAN 快路径，处理 TWAI alert，按预算读取 MCP2515，并推进非阻塞灯光/预热状态机。 |
-| WebUI 任务 | FreeRTOS core 0 任务 | 可选 SoftAP 控制/状态页。只读取缓存状态和更新配置，CAN 工作仍留在主循环。 |
-| 抓包 | PSRAM recorder | 先把二进制 CAN 帧写入 PSRAM，停止抓包后再流式导出 CSV；CAN 快路径不写 SPIFFS/LittleFS。 |
+本 README 只描述当前 `T-2CAN-WEB` 分支。旧的通用分支说明已经从本分支 README 中删除，避免混用错误接线和编译命令。
 
 ### 目标硬件
 
-- 开发板：Waveshare ESP32-S3-RS485-CAN
-- 框架：PlatformIO 下的 Arduino
-- CAN 控制器：ESP32-S3 内置 TWAI
-- CAN 速率：500 kbps
-- Flash 目标：16 MB
-- 分区表：`huge_app.csv`
-- 默认 TWAI TX：GPIO15
-- 默认 TWAI RX：GPIO16
-- LED：GPIO14
-- RX 队列长度：64
-- TX 队列长度：16
+- 开发板：LILYGO T-2CAN，ESP32-S3 N16R8 同级硬件。
+- 框架：PlatformIO + Arduino。
+- CAN 速率：两路均为 500 kbps。
+- Flash：16 MB。
+- WebUI 构建会启用 OPI PSRAM，用于抓包缓冲。
 
-### CAN 功能
+### 总线映射
+
+LILYGO 官方物理端子名容易和旧项目文字混淆，本分支按下表理解：
+
+| 固件 bus | 控制器 | LILYGO 官方物理端子 | 引脚 | 职责 |
+|---|---|---|---|---|
+| `bus=1` | ESP32-S3 原生 TWAI | 物理 `CANB` | TX `GPIO7`、RX `GPIO6` | 主 FSD 激活与限速控制总线 |
+| `bus=2` | MCP2515 SPI | 物理 `CANA` | SCK `GPIO12`、MOSI `GPIO11`、MISO `GPIO13`、CS `GPIO10`、RST `GPIO9`、INT `GPIO8`、16 MHz 晶振 | 辅助车身、灯光、预热和抓包总线 |
+
+重点：LILYGO T-2CAN V1.0 官方命名里，物理 `CANA` 是 MCP2515/SPI，物理 `CANB` 是原生 TWAI。本 README 同时写明固件 `bus=1` / `bus=2` 和官方物理端子名。
+
+### 架构
+
+| 层 | 组件 | 行为 |
+|---|---|---|
+| 主循环 | Arduino `loop()` | 处理 TWAI alert、处理一个主 TWAI 帧、按预算读取 MCP2515，并推进非阻塞功能状态机。 |
+| 主 CAN | `bus=1` / TWAI / 物理 CANB | FSD 激活、速度档、限速偏移、刹车/档位上下文和 TWAI 恢复。 |
+| 第二路 CAN | `bus=2` / MCP2515 / 物理 CANA | 车身、灯光、预热、Service Mode 和抓包上下文。 |
+| WebUI | core 0 低优先级 FreeRTOS 任务 | 提供 SoftAP 页面，只读缓存状态和更新运行期配置，不进入 CAN 快路径。 |
+| 抓包 | PSRAM 缓冲 | 先保存二进制 CAN 帧，停止抓包后下载时才格式化 CSV。 |
+
+本分支不包含 OTA、SPIFFS、LittleFS、任意 CAN 发送页面、跨总线桥接或 MITM 改写。
+
+### 主 FSD / 速度控制
+
+主总线：`bus=1` / TWAI / 物理 CANB。
 
 | CAN ID | 功能 | 行为 |
-|--------|------|------|
-| `1016` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
-| `1021 mux 0` | FSD/速度档控制 | 设置 bit `46`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后发送。 |
-| `1021 mux 1` | 控制/提示位 | 清除 bit `19`，然后发送。 |
-| `1021 mux 2` | 速度偏移 | 写入经过 slew 限幅后的 PCT4 速度偏移 raw 值。 |
-| `0x399` | 融合限速 | 读取 `data[1] & 0x1F`；`0` 和 `31` 无效；有效 raw 乘以 `5 kph`。 |
+|---|---|---|
+| `0x399` | 融合限速 | 读取 `data[1] & 0x1F`；raw `0` 和 `31` 无效；有效值为 `raw * 5 kph`。 |
+| `1016` / `0x3F8` | 跟车距离 | 读取 `data[5] bit 5..7`，更新 `speedProfile`。 |
+| `1021` / `0x3FD` mux 0 | FSD/速度档控制 | 设置 bit `46`，把 `speedProfile` 写入 `data[6] bit 1..2`，然后发送。 |
+| `1021` / `0x3FD` mux 1 | 控制位 | 清除 bit `19`，然后发送。 |
+| `1021` / `0x3FD` mux 2 | 速度偏移 | 写入经过缓降限制后的 PCT4 offset raw。 |
 
-### 跟车距离 / 速度档映射
+跟车距离映射：
 
-| `1016` 跟车距离 raw 值 | 写入的 `speedProfile` | 固件效果 |
-|------------------------|------------------------|----------|
-| `1` | `2` | 更激进速度档 |
-| `2` | `1` | 中间/默认速度档 |
-| `3` | `0` | 更柔和速度档 |
-| 其他值 | 不变 | 保持上一档 |
+| 跟车距离 raw | 写入的 `speedProfile` |
+|---|---|
+| `1` | `2` |
+| `2` | `1` |
+| `3` | `0` |
+| 其他 | 保持不变 |
 
-### FSD 激活细节
+### 限速偏移逻辑
 
-在 `1021 mux 0` 上：
+默认速度表：
 
-- 设置 bit `46`，启用 HW3 FSD/速度档控制路径。
-- 把当前 `speedProfile` 写入 `data[6] bit 1..2`。
-- 通过 TWAI 发送修改后的帧。
+| 融合限速 | 目标 / 行为 |
+|---|---|
+| `< 50 kph` | 直接 PCT4 raw `200`，即 50% |
+| `50..59 kph` | 目标 `60 kph` |
+| `60..69 kph` | 目标 `80 kph` |
+| `70..79 kph` | 目标 `85 kph` |
+| `80..89 kph` | 目标 `90 kph` |
+| `90..99 kph` | 目标 `100 kph` |
+| `100..119 kph` | 目标 `120 kph` |
+| `120..139 kph` | 目标 `140 kph` |
+| `>= 140 kph` | 不加偏移 |
 
-在 `1021 mux 1` 上：
+规则：
 
-- 清除 bit `19`。
-- 通过 TWAI 发送修改后的帧。
+- 期望偏移为 `targetSpeedKph - fusedSpeedLimitKph`。
+- 绝对偏移预夹紧为 `0..25 kph`。
+- PCT4 线编码为 `raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`。
+- PCT4 上限为 50%，所以最大 raw 为 `200`。
+- 下行缓降默认 `5%/s`。
+- 上升变化立即放行。
+- 如果没有有效融合限速，则保留原车帧里的 stock speed-offset raw。
 
-在 `1021 mux 2` 上：
+### 稳定性功能
 
-- 如果存在有效融合限速，使用计算出的 PCT4 速度偏移。
-- 如果没有有效融合限速，保留帧内原车 stock 速度偏移 raw 值。
-- 写入前应用下降 slew 限幅。
+- TWAI alert 处理。
+- bus-off 检测和自动恢复。
+- 有界 TX 短重试。
+- DLC 长度保护。
+- 主 CAN ID 的硬件过滤和软件过滤。
+- WebUI 可选 `bus=1` 只收不发模式，仅阻断 TWAI TX。
 
-### 限速读取
+### 第二路 CAN 功能
 
-`0x399` 融合限速解析：
+第二路总线：`bus=2` / MCP2515 / 物理 CANA。
 
-- 来源字段：`data[1] & 0x1F`。
-- 无效 raw 值：`0` 和 `31`。
-- 有效限速：`raw * 5 kph`。
-- 此解析器有效范围：`5..150 kph`。
+- MCP2515 在 TWAI 之后初始化。MCP2515 初始化失败时，主 FSD/速度控制仍继续工作。
+- 普通循环每轮最多读取 4 帧。
+- MCP2515 INT `GPIO8` 触发或抓包开启时，最多读取 24 帧，并有 900 us 时间上限。
+- 硬件过滤模式：
+  - `0`：接收全部标准帧，用于调试。
+  - `1`：功能相关 ID。
+  - `2`：最小运行 ID。
+- 功能/最小过滤包含 `0x082` 和 `0x339`，避免漏掉电池预热监控和 VCSEC 锁车状态。
 
-### 目标速度表
+已实现的 `bus=2` 功能：
 
-| 融合限速 | 目标速度 | 夹紧前最大期望提升 |
-|----------|----------|--------------------|
-| `< 50 kph` | 夹到 `50%` | raw `200` |
-| `50..59 kph` | `60 kph` | `60 - 限速` |
-| `60..69 kph` | `80 kph` | `80 - 限速` |
-| `70..79 kph` | `85 kph` | `85 - 限速` |
-| `80..89 kph` | `90 kph` | `90 - 限速` |
-| `90..99 kph` | `100 kph` | `100 - 限速` |
-| `100..119 kph` | `120 kph` | `120 - 限速` |
-| `120..139 kph` | `140 kph` | `140 - 限速` |
-| `>= 140 kph` | 等于限速 | `0 kph` |
+- **Service Mode（`0x339`）**：WebUI 开关会排队发送 4 帧、间隔 10 ms。开启帧为 `00 00 00 00 00 80 00 00`，关闭帧清除 byte 5。
+- **超车灯爆闪（`0x249`）**：启用后，1.2 秒内两次 PULL 触发 8 次 PULL/idle 脉冲，默认 75 ms 开 / 75 ms 关。
+- **后雾灯减速爆闪（`0x273`）**：启用后，缓减速触发 3 次，急减速触发 5 次，节奏 500 ms。
+- **倒车双闪 + 后雾灯爆闪**：启用后，`bus=1` `0x118` 倒挡，或刹车 + `bus=2` `0x3C2` 右滚轮向后，触发双闪和后雾灯脉冲。
+- **滚轮换挡注入（`0x229`）**：实验功能，默认关闭。踩刹车时，右滚轮向后请求 R，向前请求 D。
+- **电池预热（`0x082`）**：启用后，每 200 ms 在 `bus=2` 发送动态 `UI_tripPlanning`。
+- **锁车触发 deep sleep**：启用后，识别 `0x273` 或 `0x339` 的有效锁车信号，禁止所有 CAN TX、关闭 WiFi/TWAI，并进入 ESP32 deep sleep。
 
-### 速度偏移规则
+### 电池预热细节
 
-- 期望偏移：`targetSpeedKph - fusedSpeedLimitKph`。
-- 绝对偏移预夹紧：`0..25 kph`。
-- PCT4 百分比上限：`50%`。
-- PCT4 raw 公式：`raw = round(offsetKph / fusedSpeedLimitKph * 100) * 4`。
-- 算法最终使用 raw 范围：`0..200`。
-- raw 写入 `1021 mux 2` 的 `data[0] bit 6..7` 和 `data[1] bit 0..5`。
+固件缓存最新有效原车 `0x082` 上下文字段 `byte1..7`，只覆盖 `byte0`。
 
-默认表下的例子：
+- 当前 fallback/context：`01 50 AC 32 FF 03 61 15`。
+- WebUI ON 帧：`AF 50 AC 32 FF 03 61 15`。
+- WebUI OFF 使用 byte0 `0x01`，并在停止前补发数帧 OFF。
 
-| 融合限速 | 目标 | 夹紧后偏移 | 百分比 | PCT4 raw |
-|----------|------|------------|--------|----------|
-| `30 kph` | `60 kph` | `25 kph` | 夹到 `50%` | `200` |
-| `45 kph` | 夹到 `50%` | n/a | `50%` | `200` |
-| `50 kph` | `60 kph` | `10 kph` | `20%` | `80` |
-| `55 kph` | `60 kph` | `5 kph` | `9%` | `36` |
-| `60 kph` | `80 kph` | `20 kph` | `33%` | `132` |
-| `70 kph` | `85 kph` | `15 kph` | `21%` | `84` |
-| `75 kph` | `85 kph` | `10 kph` | `13%` | `52` |
-| `80 kph` | `90 kph` | `10 kph` | `13%` | `52` |
-| `90 kph` | `100 kph` | `10 kph` | `11%` | `44` |
-| `100 kph` | `120 kph` | `20 kph` | `20%` | `80` |
-| `120 kph` | `140 kph` | `20 kph` | `17%` | `68` |
-| `140 kph+` | 等于限速 | `0 kph` | `0%` | `0` |
+WebUI 诊断会解码：
 
-### Slew 限幅
+- 请求位和状态位，
+- 功率请求，
+- 目标温度，
+- 目的地环境温度，
+- 充电目标，
+- 到达能量 raw 值，
+- BMS 温度候选帧 `0x312`、`0x712`、`0x374`。
 
-Slew 限幅只限制 raw 下降，因为偏移突然消失可能带来突然减速体感。
+测试 BMS 温度诊断时，请把 MCP2515 硬件过滤设为接收全部，因为这些 BMS 候选 ID 不在功能/最小过滤集合里。
 
-- 默认下降限幅：`5%/秒`。
-- PCT4 raw 下降速率：`5 * 4 = 20 raw/秒`。
-- 偏移上升立即放行。
-- 当融合限速突然变化导致目标 raw 降低时，固件会平滑下降，而不是直接跳到低值。
+### 锁车 Deep Sleep
 
-### CAN 稳定性功能
+WebUI 启用后，锁车休眠只参考 `bus=2` / MCP2515 / 物理 CANA：
 
-- 启用的 TWAI alerts：
-  - bus-off
-  - bus recovered
-  - recovery in progress
-  - error passive
-  - bus error
-  - TX failed
-  - RX queue full
-  - RX FIFO overrun
-- 检测 bus-off 并自动发起恢复。
-- 恢复后自动重新启动 TWAI。
-- TX 失败短重试：`1` 次，间隔 `1 ms`。
-- TX 等待超时：`5 ms`。
-- RX 等待超时：`1 ms`。
-- RX 每轮最多扫描：`8` 帧。
-- 所有解析帧都有 DLC 保护。
-- 拒绝扩展帧、远程帧和超长帧。
-- 硬件验收过滤：围绕 `0x399`、`1016`、`1021` 的 16 个 ID 粗过滤集合。
-- 软件精确过滤：只处理 `0x399`、`1016`、`1021`。
+- `0x273` lock request 值 `1` 或 `4`。
+- `0x339` VCSEC lock status。
 
-### 编译与烧录
+识别到有效锁车信号后：
 
-```bash
-pio run -e waveshare_ESP32_S3_RS485_CAN
-pio run -e waveshare_ESP32_S3_RS485_CAN -t upload
-```
+- 禁止所有 CAN TX，
+- 清除活跃的爆闪、预热、换挡状态，
+- 关闭 WiFi，
+- 停止并卸载 TWAI，
+- ESP32 进入 deep sleep。
 
-擦除后烧录：
+没有移植座椅、EPAS 或通用超时休眠判断。车载 USB 供电安装场景下，预期唤醒方式是 USB 恢复供电后冷启动。
 
-```bash
-pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 --port COM15 erase_flash
-pio run -e waveshare_ESP32_S3_RS485_CAN -t upload --upload-port COM15
-```
+### WebUI
 
-### LILYGO T-2CAN（双 CAN）
+构建环境：`lilygo_t2can_arduino_webui`。
 
-`T-2CAN` 分支同时支持 **LILYGO T-2CAN** 开发板，该板提供两路 CAN。仍保持
-Arduino/PlatformIO 框架和同一个快速 `loop()`。固件保留历史 CSV 标签
-`bus=1` / `bus=2`，但 WebUI、CSV、README 同时显示官方 LILYGO 物理端子名，
-避免把板载 CANA/CANB 和项目旧命名混淆。
+- SoftAP IP / gateway：`100.100.1.1`。
+- Web 任务在 core 0 低优先级运行。
+- CAN 快路径不调用 `server.handleClient()`。
+- 页面轮询由用户手动开启，间隔限制为 1 秒。
+- 关闭 WebUI 后会停止请求并关闭 SoftAP。
+- 运行期配置先写 RAM，只有点击 Save 才持久化。
+- 不包含 OTA 页面。
 
-| CSV bus | 控制器 | 官方 LILYGO 物理端子 | 引脚 | 职责 |
-|---------|--------|------------------------|------|------|
-| `bus=1` | ESP32-S3 原生 TWAI | 物理 `CANB` | TX `GPIO7`、RX `GPIO6` | FSD 激活 + 限速修改 |
-| `bus=2` | MCP2515（SPI） | 物理 `CANA` | SCK `GPIO12`、MOSI `GPIO11`、MISO `GPIO13`、CS `GPIO10`、RST `GPIO9`、INT `GPIO8`、16 MHz 晶振 | 车身/灯光/右拨杆/预热/抓包上下文 |
+WebUI 提供：
 
-重要映射：官方 LILYGO T-2CAN V1.0 的 **物理 CANA = MCP2515/SPI**，
-**物理 CANB = 原生 TWAI**。旧项目文字里曾用 “CAN A” 表示 TWAI、
-“CAN B” 表示 MCP2515，这与板子丝印是反的。
+- FSD 开关，
+- 自动限速偏移开关，
+- 速度表和缓降设置，
+- CANB 开关，
+- CANB 过滤模式，
+- Service Mode，
+- 灯光/爆闪功能，
+- 滚轮换挡注入，
+- 电池预热，
+- 锁车 deep sleep，
+- TWAI 只收不发模式，
+- 状态计数器，
+- PSRAM 抓包控制。
 
-- 所有引脚来自 PlatformIO `build_flags`（`-DTWAI_*`、`-DMCP2515_*`），固件里不硬编码 LilyGO 引脚。
-- bus=1/TWAI/物理 CANB 保留全部既有功能：`0x399` 融合限速读取、`1016` 跟车距离、`1021 mux0/1/2`
-  FSD 激活 / 清 bit19 / PCT4 限速偏移、完整目标速度表、`5%/秒` 下降缓降、TWAI
-  alert、bus-off 自动恢复、TX 短重试、DLC 保护、RX 过滤。
-- MCP2515/物理 CANA 在 TWAI 之后初始化；MCP2515 缺失或初始化失败时保持关闭，
-  绝不阻塞或影响 bus=1/TWAI/FSD。普通循环每轮读取 4 帧；MCP2515 INT `GPIO8`
-  触发或抓包开启时最多读取 24 帧，并有 900 us 时间上限。
-- **MCP2515 硬件过滤**：WebUI 提供三档：`0` 接收全部标准帧用于调试，
-  `1` 功能相关 ID，`2` 最小运行 ID。功能/最小过滤都包含 `0x082` 和
-  `0x339`，避免开启过滤后漏掉电池预热抓包/监控和 VCSEC 锁车状态识别。
-- **MCP2515/物理 CANA Service Mode（`0x339`）**：默认关闭。切换时排队发送 4 帧、间隔 10 ms
-  （`millis()` 非阻塞调度，不使用 `delay()`），只发到 bus=2/MCP2515/物理 CANA（开启
-  `00 00 00 00 00 80 00 00`，关闭 `…00 00`）。
-- **高光爆闪（`0x249`）**：在 WebUI 启用后，1.2 秒内下拉超车灯拨杆两次，触发
-  8 次高光脉冲。固件在 bus=2/MCP2515/物理 CANA 上发送 `status=1` PULL 和 `status=0` idle，
-  默认 75 ms 开 / 75 ms 关，结束后强制 idle。`0x3F5` 只用于灯态反馈。
-- **后雾灯减速爆闪**：在 WebUI 启用后，缓减速触发 3 次后雾灯爆闪，急减速触发
-  6 次后雾灯爆闪。主判断信号是 `0x111/0x116 RCM_inertial2` 纵向加速度；
-  `0x145` ESP 刹车状态、`0x273` 刹车灯状态、`0x148` 制动扭矩请求、
-  `0x185` 四轮制动扭矩、`0x118` 回收/车辆加速度、`0x186` 负扭矩、
-  `0x257` 车速下降作为辅助确认。输出优先复用最新实时 `0x273` 帧，只切换
-  `data[2] bit7`（`0x80`），避免覆盖车内氛围灯、脚窝灯等无关灯光位。
-- **倒挡双闪 + 后雾灯爆闪**：在 WebUI 启用后有两个触发源：(a) bus=1/TWAI/物理 CANB `0x118`
-  （`DI_systemStatus`）的 `DI_gear = 2`（R 档）从非 R 进入 R 的上升沿；(b)
-  **踩刹车 + 右滚轮向后**——即刹车踩下时 bus=2/MCP2515/物理 CANA `0x3C2`（`VCLEFT_switchStatus`，
-  `data[3] bits0..5`，6-bit 有符号）的 `VCLEFT_swcRightScrollTicks < 0`。踩刹车
-  + 右滚轮向前（`> 0`）视为 D 档意图并取消爆闪。触发后发送 bus=2/MCP2515/物理 CANA `0x3C2` 双闪按钮
-  （`byte0 bit3` = `VCLEFT_hazardButtonPressed`）——**亮 0.5s / 灭 0.5s，共 4 次**，
-  复用最新实时 `0x3C2` mux0 帧——并同步输出 bus=2/MCP2515/物理 CANA `0x273` 后雾灯。注意 `0x3C2` 为
-  多路复用帧：双闪按钮在 mux0、`rightScrollTicks` 在 mux1。真正的 D/R 换挡命令
-  （`0x109 SBW_RQ_SCCM`）**不注入**——其 CRC 未知、且两条已接总线都未抓到该帧——
-  所以这里只作为触发源；双闪按钮帧/节奏仍需实车验证。
-- **电池预热触发（`0x082`）**：在 WebUI 启用后，T-2CAN 构建每 200 ms 在
-  `bus=2/MCP2515/物理 CANA` 发送 `0x082`（`UI_tripPlanning`）。固件会缓存
-  最新有效原车 `0x082` 的背景字段（`byte1..7`），只覆盖 `byte0` 为 ON
-  （`0xAF`）或 OFF（`0x01`）。这样适配不同抓包中温度/能量等路线字段变化，
-  也降低原车 inactive `0x082` 把注入请求覆盖掉的概率。93/94/95 抓包中最新
-  有效上下文字段为 `01 50 AC 32 FF 03 61 15`；WebUI ON 帧会变为
-  `AF 50 AC 32 FF 03 61 15`。
-- **电池预热诊断**：WebUI 状态区会解码最新原车 `0x082` 的请求位、预热状态、
-  目标温度、目的地环境温度、功率请求、充电目标和到达能量 raw 值；同时被动监听
-  两路 CAN 上的 BMS 温度候选帧（`0x312`、`0x712`、`0x374`），显示最后收到的
-  bus、ID、mux、年龄和 raw payload。BMS 温度候选帧不在当前 MCP2515 功能/最小
-  硬件过滤集合内，测试时需要把 WebUI 硬件过滤模式设为“接收全部”。
-- **锁车触发深度休眠**：在 WebUI 启用后，T-2CAN 构建只参考
-  `bus=2/MCP2515/物理 CANA` 上的锁车信号：`0x273` 锁车请求
-  （`lockRequest` 为 `1` 或 `4`）以及 `0x339` VCSEC 锁定状态。识别到有效锁车后，
-  固件立即禁止所有 CAN TX，停止常规功能，关闭 WiFi，停止 TWAI，并进入 ESP32
-  deep sleep。没有移植座椅、EPAS 或超时类休眠判断。当前 USB 车载供电场景下，
-  预期唤醒方式是车辆 USB 恢复供电后开发板重新上电初始化。
-- **CAN 抓包**：WebUI 构建包含轻量双路 CSV 抓包功能，支持 include 过滤
-  （`ids=`）、exclude、状态轮询、停止和下载。抓包时先保存二进制帧，下载时再
-  格式化成 CSV；CSV 增加 `controller` 和 `physical` 列，明确 `bus=1` 是
-  `TWAI/物理 CANB`，`bus=2` 是 `MCP2515/物理 CANA`。CSV 使用 HTTP 分块输出，
-  必须停止抓包后再下载。
-- **PSRAM 抓包缓冲**：WebUI 构建开启 OPI PSRAM，并把抓包缓冲分配到 PSRAM。
-  默认容量为 `100000` 帧，约 2.4 MB。CAN 快路径不实时写 SPIFFS/LittleFS/Flash。
+### 抓包
 
-本分支暂不移植：WebUI 任意 CAN 发送、跨总线桥接、MITM 改写，以及写入
-Flash 文件系统的持久化抓包文件。
+WebUI 构建包含轻量双路 CSV 抓包：
 
-### 轻量 WebUI（可选）
+- 先把二进制帧保存到 PSRAM，
+- 支持 include 和 exclude ID 过滤，
+- 记录双路总线方向、controller 和 physical 标签，
+- 停止抓包后下载时才格式化并流式输出 CSV，
+- CAN 快路径不写 SPIFFS/LittleFS。
 
-通过 `-DENABLE_LIGHT_WEBUI`（`lilygo_t2can_arduino_webui` 环境）可编译一个最小化的
-SoftAP 参数页面。它被刻意隔离，绝不进入 CAN 快路径：
+CSV 标签：
 
-- 热点 `T2CAN-FSD` / 密码 `12345678`；页面地址 **`http://100.100.1.1`**（由 `softAPConfig` 设定）。
-- 运行在独立的低优先级 FreeRTOS 任务，pin 到 **core 0**；CAN `loop()` 不等待 HTTP。
-- 接口：`GET /`、`GET /status`、`POST /config`、`POST /save`、`POST /test`、
-  `POST /rec_start`、`POST /rec_stop`、`GET /rec_status`、`GET /rec_download`、
-  `POST /web/off`。
-- `/status` 只读缓存的状态/配置快照（绝不触发 CAN）；`/config` 只改 RAM；只有
-  `/save` 才写 Flash（`Preferences`）。
-- 页面**默认不轮询**——轮询需手动开启，最快每秒一次；关闭 WebUI 后停止所有请求并关闭 SoftAP。
-- 高光闪烁开关是布防/取消布防；启用后双拉超车灯拨杆触发一轮 8 次闪烁，完成后
-  自动停止，开关可保持开启以等待下一次双拉触发。
-- 后雾灯爆闪开关同样是布防/取消布防；缓减速触发 3 次，急减速触发 6 次。
-  `0x145` 和 `0x273` 只作为确认输入，不再作为单帧直接触发源。
-- 倒挡双闪雾灯开关同样是布防/取消布防；进入 R 档（0x118）或踩刹车+右滚轮向后
-  （0x3C2）触发 4 次，完成后自动停止；不注入 0x109 换挡命令，仅作触发源。
-- 电池预热开关打开后每 200 ms 在 `bus=2/MCP2515/物理 CANA` 发送动态 `0x082` ON 帧，关闭后补发数帧 OFF 再停止。
-- 电池预热诊断里，`Cx100` 表示摄氏度乘以 100；`-32768` 表示 SNA/未收到有效值。若 `BMS temp frame seen=0`，说明当前接线或 MCP2515 硬件过滤没有收到 `0x312/0x712/0x374`。
-- WebUI 会把 `0x082` 的 SNA 字段显示为 `SNA`，把 BMS 温度帧 ID 显示为十六进制，并在收到 `0x712` 时单独显示该帧的 mux 与 `b1-b7` 原始字节组，便于后续按实车抓包确认温度比例/偏移。
-- 清空抓包 ID 只是不做录制层过滤；bus=1/TWAI 仍只记录固件关注的 FSD/底盘 ID。
-  查未知右滚轮 ID 时，关闭 MCP2515 硬件过滤后短时间抓 bus=2/MCP2515。
-- 不含 OTA，不含 SPIFFS/LittleFS 文件抓包。抓包写入 PSRAM，停止后下载 CSV。
+- `bus=1`：`TWAI`，物理 `CANB`。
+- `bus=2`：`MCP2515`，物理 `CANA`。
 
-### 编译与烧录（LILYGO T-2CAN）
+### 编译与下载
 
-```bash
+无 WebUI 的 LILYGO 构建：
+
+```powershell
 pio run -e lilygo_t2can_arduino
 pio run -e lilygo_t2can_arduino -t upload --upload-port COMx
 ```
 
-WebUI 构建：
+WebUI 版 LILYGO 构建：
 
-```bash
+```powershell
 pio run -e lilygo_t2can_arduino_webui
+pio run -e lilygo_t2can_arduino_webui -t upload --upload-port COMx
 ```
 
-WebUI 构建会开启 LILYGO T-2CAN OPI PSRAM：
+最近验证过的上传示例：
 
-```text
-board_build.arduino.memory_type = qio_opi
--DBOARD_HAS_PSRAM
--DREC_CAP=100000
+```powershell
+pio run -e lilygo_t2can_arduino_webui -t upload --upload-port COM23
 ```
 
-### 16 MB 全量 BIN
+### 文件
 
-本分支可以生成从 `0x0` 写入的 16 MB 合并全量镜像。常见本地输出路径：
-
-```text
-release/ESP32-FSD/ESP32-FSD-waveshare-full-16MB.bin
-```
-
-16 MB 全量包适合完整工厂式烧录；日常开发仍可用普通 PlatformIO upload。
-
-### 适用场景
-
-如果你需要当前功能最完整的 ESP32-S3 固件：HW3 FSD 激活、限速感知速度偏移、DEV 兼容的 PCT4 默认编码、下降 slew 保护，以及 TWAI 稳定性处理，使用这个分支。
+- 固件：`ESP32S3CAN-FSD/ESP32S3CAN-FSD.ino`
+- WebUI 页面：`ESP32S3CAN-FSD/web_ui_page.h`
+- 编译配置：`platformio.ini`
+- 工作总结：`WORK_SUMMARY.md`
