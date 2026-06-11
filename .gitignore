@@ -1,5 +1,7 @@
 # Arduino/RP2040/ESP32 build artifacts
 build/
+.pio/
+*.ino.cpp
 *.elf
 *.bin
 *.uf2
@@ -14,6 +16,11 @@ build/
 *.zip
 *.7z
 *.rar
+
+# Local data / reference dumps (not source — keep them out of the change view)
+Downloads/
+opendbc-master/
+源代码与抓包数据/
 
 # OS/editor files
 .DS_Store

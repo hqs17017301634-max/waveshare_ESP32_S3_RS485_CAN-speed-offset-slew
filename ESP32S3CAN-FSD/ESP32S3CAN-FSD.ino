@@ -4,22 +4,55 @@
     the Free Software Foundation, either version 3 of the License, or
     (at your option) any later version.
 
-    ESP32S3 variant — uses the built-in TWAI (CAN) peripheral instead of MCP2515.
+    ESP32S3 variant 鈥?uses the built-in TWAI (CAN) peripheral instead of MCP2515.
 
-    CAN-only build for Waveshare ESP32-S3-RS485-CAN (16MB flash).
-    WiFi and Bluetooth are never initialized, so both radios stay powered down.
-    Only stable CAN messaging + FSD activation / speed control is kept.
+    Two supported boards (selected via PlatformIO build_flags):
+      * Waveshare ESP32-S3-RS485-CAN 鈥?single CAN, TWAI only.
+      * LILYGO T-2CAN 鈥?dual CAN:
+          - CAN A / CAN1: ESP32-S3 native TWAI (GPIO7/GPIO6) 鈥?FSD activation and
+            speed-limit modification. This is the primary, time-critical bus.
+          - CAN B / CAN2: MCP2515 over SPI (GPIO12/11/13/10/9) 鈥?second auxiliary
+            bus (basic RX/TX/counters + optional 0x339 service-mode burst).
+
+    WiFi/Bluetooth stay powered down unless the light WebUI is compiled in
+    (-DENABLE_LIGHT_WEBUI), in which case a SoftAP + tiny parameter page run on
+    a dedicated low-priority task so the CAN fast path is never blocked.
 */
 
 #include <algorithm>
 #include <cstring>
 #include <driver/twai.h>
+#include <esp_sleep.h>
+#ifdef ENABLE_LIGHT_WEBUI
+#include <esp_heap_caps.h>
+#endif
+
+// ---- CAN B (MCP2515) 鈥?optional secondary bus ----
+// The autowp MCP2515 library provides its own `struct can_frame` with the same
+// field layout (can_id / can_dlc / data[8]) the handler already expects, so we
+// only define our own copy when the library is absent. Defining both in one
+// translation unit would be a redefinition error 鈥?hence the #else.
+#ifdef ENABLE_CANB_MCP2515
+#include <SPI.h>
+#include <mcp2515.h>
+#else
+struct can_frame {
+  uint32_t can_id;
+  uint8_t  can_dlc;
+  uint8_t  data[8];
+};
+#endif
+
+// ---- Light WebUI 鈥?optional ----
+#ifdef ENABLE_LIGHT_WEBUI
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#endif
 
 // This build supports the HW3 car only.
 
-constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
-
-// Pin assignments — overridable via PlatformIO build_flags (-D...).
+// Pin assignments 鈥?overridable via PlatformIO build_flags (-D...).
 // Defaults match the Waveshare ESP32-S3-RS485-CAN board.
 #ifndef TWAI_TX_PIN
 #define TWAI_TX_PIN GPIO_NUM_15
@@ -31,7 +64,7 @@ constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
 #define PIN_LED 14
 #endif
 
-// TWAI RX/TX queue depths — overridable via build_flags.
+// TWAI RX/TX queue depths 鈥?overridable via build_flags.
 #ifndef TWAI_RX_QUEUE_LEN
 #define TWAI_RX_QUEUE_LEN 64
 #endif
@@ -39,14 +72,50 @@ constexpr bool enableAutoOffsetFromFusedSpeedLimit = true;
 #define TWAI_TX_QUEUE_LEN 16
 #endif
 
-constexpr int AUTO_TARGET_SPEED = 60;
-constexpr int AUTO_TARGET_SPEED_AT_80 = 80;
-constexpr int AUTO_TARGET_SPEED_AT_100 = 100;
-constexpr int AUTO_TARGET_SPEED_AT_120 = 120;
+// ---- CAN B (MCP2515) pin/clock fallbacks 鈥?overridable via build_flags ----
+#ifdef ENABLE_CANB_MCP2515
+#ifndef MCP2515_SCK
+#define MCP2515_SCK 12
+#endif
+#ifndef MCP2515_MOSI
+#define MCP2515_MOSI 11
+#endif
+#ifndef MCP2515_MISO
+#define MCP2515_MISO 13
+#endif
+#ifndef MCP2515_CS
+#define MCP2515_CS 10
+#endif
+#ifndef MCP2515_RST
+#define MCP2515_RST 9
+#endif
+#ifndef MCP2515_INT
+#define MCP2515_INT 8
+#endif
+#ifndef MCP2515_CLOCK
+#define MCP2515_CLOCK MCP_16MHZ
+#endif
+// SocketCAN-style id flags (defined by the autowp can.h; guarded for safety).
+#ifndef CAN_EFF_FLAG
+#define CAN_EFF_FLAG 0x80000000UL
+#endif
+#ifndef CAN_RTR_FLAG
+#define CAN_RTR_FLAG 0x40000000UL
+#endif
+#ifndef CAN_SFF_MASK
+#define CAN_SFF_MASK 0x000007FFUL
+#endif
+#endif  // ENABLE_CANB_MCP2515
+#ifndef CAN_SFF_MASK
+#define CAN_SFF_MASK 0x000007FFUL
+#endif
+
+// ---- Speed-offset encoding constants (wire format, not user-tunable) ----
+constexpr int LOW_SPEED_MAX_PCT_LIMIT_KPH = 50;
 constexpr int MAX_SPEED_OFFSET_KPH = 25;     // absolute pre-clamp on the computed offset
 constexpr int MAX_SPEED_OFFSET_PCT = 50;     // PCT4 wire cap (matches dev kHw3SpeedOffsetMaxPct)
 constexpr int OFFSET_PCT4_RAW_PER_PCT = 4;
-constexpr uint8_t OFFSET_SLEW_RATE_PCT_PER_SEC = 15;
+
 constexpr uint32_t TWAI_ALERT_MASK =
   TWAI_ALERT_BUS_OFF |
   TWAI_ALERT_BUS_RECOVERED |
@@ -62,20 +131,262 @@ constexpr uint32_t TWAI_TX_RETRY_DELAY_MS = 1;
 constexpr uint8_t TWAI_TX_RETRY_COUNT = 1;
 constexpr uint8_t TWAI_RX_SCAN_LIMIT = 8;
 
-// ---- CAN frame abstraction (mirrors RP2040 can_frame for handler compatibility) ----
+constexpr uint8_t CANB_FILTER_ALL = 0;
+constexpr uint8_t CANB_FILTER_FEATURE = 1;
+constexpr uint8_t CANB_FILTER_MINIMUM = 2;
 
-struct can_frame {
-  uint32_t can_id;
-  uint8_t  can_dlc;
-  uint8_t  data[8];
+// ---- Runtime configuration (WebUI-tunable; defaults match the legacy constants) ----
+// CAN A reads this every relevant frame, so updates must stay cheap. The legacy
+// firmware used plain constexpr values; the defaults below are byte-for-byte
+// equivalent, so behaviour with no WebUI is unchanged.
+struct RuntimeConfig {
+  bool fsdEnabled = true;
+  bool autoSpeedOffsetEnabled = true;
+  uint8_t slewPctPerSec = 5;
+  uint8_t lowSpeedMaxPctRaw = 200;    // = MAX_SPEED_OFFSET_PCT * OFFSET_PCT4_RAW_PER_PCT
+
+  uint16_t targetBelow60 = 60;
+  uint16_t target60 = 80;
+  uint16_t target70 = 85;
+  uint16_t target80 = 90;
+  uint16_t target90 = 100;
+  uint16_t target100 = 120;
+  uint16_t target120 = 140;
+
+  bool canbEnabled = true;
+  bool canbServiceModeEnabled = false;
+  uint8_t canbFilterMode = CANB_FILTER_ALL; // 0=all, 1=feature IDs, 2=minimum runtime IDs
+  bool highBeamStrobeEnabled = false; // arms double-pull flash-to-pass trigger
+  bool rearFogBrakeStrobeEnabled = false; // arms brake-triggered 0x273 rear fog burst
+  bool reverseStrobeEnabled = false;  // arms reverse-gear hazard + rear-fog burst
+  bool batteryPreheatEnabled = false; // sends UI_tripPlanning 0x082 every 200 ms
+  bool scrollGearSimEnabled = true;    // show brake + right-scroll D/R intent only
+  bool scrollGearInjectEnabled = false; // experimental: inject 0x229 right-stalk D/R request
+  bool can1ReceiveOnly = false;        // bus=1/TWAI/physical CANB RX-only: gate TWAI TX
+  bool lockDeepSleepEnabled = false;    // enter deep sleep immediately after a validated vehicle lock signal
 };
 
+static RuntimeConfig g_config;
+
+// ---- Runtime status snapshot (CAN fast path writes, WebUI reads) ----
+struct RuntimeStatus {
+  uint32_t can1Rx = 0;
+  uint32_t can1Tx = 0;
+  uint32_t can1TxFail = 0;
+  uint32_t twaiBusOffCount = 0;
+  uint8_t twaiState = 0;
+
+  uint32_t canbRx = 0;
+  uint32_t canbTx = 0;
+  uint32_t canbTxFail = 0;
+  uint32_t canbLastId = 0;
+  uint8_t canbErrorFlags = 0;
+  uint32_t canbRxOverflowCount = 0;
+  uint8_t highBeamStrobeActive = 0;
+  uint8_t highBeamStrobeRemaining = 0;
+  uint8_t rearFogBrakeStrobeActive = 0;
+  uint8_t rearFogBrakeStrobeRemaining = 0;
+  uint8_t reverseStrobeActive = 0;
+  uint8_t reverseStrobeRemaining = 0;
+  uint8_t batteryPreheatActive = 0;
+  uint8_t batteryPreheatVehicleSeen = 0;
+  uint8_t batteryPreheatTemplateValid = 0;
+  uint8_t batteryPreheatUiTripActive = 0;
+  uint8_t batteryPreheatUiNavToSupercharger = 0;
+  uint8_t batteryPreheatUiFastChargerType = 0;
+  uint8_t batteryPreheatUiState = 0;
+  uint8_t batteryPreheatUiRequestHeat = 0;
+  int batteryPreheatUiPowerW = 0;
+  int batteryPreheatUiTargetCx100 = 0;
+  int batteryPreheatUiAmbientCx100 = 0;
+  int batteryPreheatUiChargeTargetCx10 = 0;
+  int batteryPreheatUiEnergyAtDestination = 0;
+  uint32_t batteryPreheatVehicleAgeMs = 0;
+  uint8_t bmsTempFrameSeen = 0;
+  uint32_t bmsTempFrameId = 0;
+  uint8_t bmsTempFrameBus = 0;
+  uint8_t bmsTempFrameMux = 0;
+  uint32_t bmsTempFrameAgeMs = 0;
+  char bmsTempFramePayload[24] = "-";
+  int8_t rightScrollTicks = 0;
+  uint8_t rightStalkStatus = 0;
+  uint8_t rightStalkCounter = 0;
+  uint8_t currentGear = 0;
+  uint8_t brakeActive = 0;
+  int8_t scrollGearIntent = 0;       // -1=R, 0=none, 1=D
+  uint8_t scrollGearDryRun = 0;
+  uint8_t scrollGearInjectActive = 0;
+  uint8_t scrollGearInjectTarget = 0; // 2=R, 4=D
+  uint8_t scrollGearInjectOk = 0;
+  uint8_t scrollGearInjectBlocked = 0;
+  int vehicleSpeedKph = 0;
+  uint8_t lockSleepArmed = 0;
+  uint8_t lockSleepTriggered = 0;
+  uint32_t lockSleepLastId = 0;
+  uint8_t lockSleepSource = 0; // 1=0x273 UI request, 2=0x339 VCSEC
+  uint32_t lockSleepAgeMs = 0;
+
+  int fusedLimitKph = 0;
+  int targetSpeedKph = 0;
+  int offsetKph = 0;
+  uint8_t offsetRaw = 0;
+};
+
+static RuntimeStatus g_status;
+
+// Config is shared between the CAN core and the WebUI task. A short spinlock
+// guards writes; the CAN path takes a one-shot consistent copy per frame. With
+// no WebUI compiled in there are no writers, so we skip the lock entirely.
+#ifdef ENABLE_LIGHT_WEBUI
+static portMUX_TYPE g_cfgMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+static inline RuntimeConfig configSnapshot() {
+#ifdef ENABLE_LIGHT_WEBUI
+  portENTER_CRITICAL(&g_cfgMux);
+  RuntimeConfig c = g_config;
+  portEXIT_CRITICAL(&g_cfgMux);
+  return c;
+#else
+  return g_config;
+#endif
+}
+
+static inline void applyBuildModeGuards(RuntimeConfig& c) {
+  (void)c;  // no build-mode overrides on this branch
+}
+
+#ifdef ENABLE_LIGHT_WEBUI
+#ifndef REC_CAP
+#define REC_CAP 4000
+#endif
+static constexpr uint32_t REC_TARGET_CAP = REC_CAP;
+static constexpr uint32_t REC_MAX_DURATION_MS = 60000UL;
+static constexpr uint8_t REC_FILTER_MAX = 16;
+
+struct RecFrame {
+  uint32_t ts;
+  char dir;
+  uint8_t bus;
+  uint32_t id;
+  uint8_t dlc;
+  uint8_t data[8];
+};
+
+static portMUX_TYPE g_recMux = portMUX_INITIALIZER_UNLOCKED;
+static RecFrame* recBuf = nullptr;
+static uint32_t recCapacity = 0;
+static size_t recBufferBytes = 0;
+static bool recPsramReady = false;
+static volatile bool recActive = false;
+static volatile uint32_t recCount = 0;
+static volatile uint32_t recDropped = 0;
+static volatile uint32_t recBus1Count = 0;
+static volatile uint32_t recBus2Count = 0;
+static volatile uint8_t recStopReason = 0; // 0=none/manual, 1=full, 2=timeout
+static volatile bool recSaved = false;
+static uint32_t recStartMs = 0;
+static uint32_t recFilterIds[REC_FILTER_MAX];
+static uint8_t recFilterCount = 0;
+static uint32_t recExcludeIds[REC_FILTER_MAX];
+static uint8_t recExcludeCount = 0;
+
+static bool recIdInList(uint32_t id, const uint32_t* ids, uint8_t count) {
+  for (uint8_t i = 0; i < count; ++i) {
+    if (ids[i] == id) return true;
+  }
+  return false;
+}
+
+static bool recFramePassesFilter(uint32_t id) {
+  if (recFilterCount > 0 && !recIdInList(id, recFilterIds, recFilterCount)) return false;
+  if (recExcludeCount > 0 && recIdInList(id, recExcludeIds, recExcludeCount)) return false;
+  return true;
+}
+
+static void setupRecorderBuffer() {
+  recPsramReady = psramInit();
+  if (!recPsramReady) return;
+
+  recBufferBytes = static_cast<size_t>(REC_TARGET_CAP) * sizeof(RecFrame);
+  recBuf = static_cast<RecFrame*>(heap_caps_malloc(recBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!recBuf) {
+    recBufferBytes = 0;
+    recCapacity = 0;
+    return;
+  }
+  recCapacity = REC_TARGET_CAP;
+}
+
+static void recordCanFrame(const can_frame& frame, char dir, uint8_t bus) {
+  if (!recActive) return;
+  if (!recBuf || recCapacity == 0) return;
+  if (millis() - recStartMs >= REC_MAX_DURATION_MS) {
+    portENTER_CRITICAL(&g_recMux);
+    recActive = false;
+    recSaved = true;
+    recStopReason = 2;
+    portEXIT_CRITICAL(&g_recMux);
+    return;
+  }
+  const uint32_t id = frame.can_id & CAN_SFF_MASK;
+  if (!recFramePassesFilter(id)) return;
+
+  portENTER_CRITICAL(&g_recMux);
+  if (!recActive) {
+    portEXIT_CRITICAL(&g_recMux);
+    return;
+  }
+  uint32_t idx = recCount;
+  if (idx >= recCapacity) {
+    recActive = false;
+    recSaved = true;
+    recDropped++;
+    recStopReason = 1;
+    portEXIT_CRITICAL(&g_recMux);
+    return;
+  }
+  RecFrame& r = recBuf[idx];
+  r.ts = millis();
+  r.dir = dir;
+  r.bus = bus;
+  r.id = id;
+  r.dlc = frame.can_dlc <= 8 ? frame.can_dlc : 8;
+  memset(r.data, 0, sizeof(r.data));
+  memcpy(r.data, frame.data, r.dlc);
+  recCount = idx + 1;
+  if (bus == 1) recBus1Count++;
+  if (bus == 2) recBus2Count++;
+  if (recCount >= recCapacity) {
+    recActive = false;
+    recSaved = true;
+    recStopReason = 1;
+  }
+  portEXIT_CRITICAL(&g_recMux);
+}
+#else
+static inline void recordCanFrame(const can_frame&, char, uint8_t) {}
+#endif
+
+// ---- TWAI helpers ----
+
 static bool twaiRecoveryInProgress = false;
+static uint32_t batteryPreheatLastSendMs = 0;
+static volatile bool canTxInhibitedForSleep = false;
+static bool lockDeepSleepPending = false;
+static uint32_t lockDeepSleepPendingMs = 0;
+static uint32_t lockSleepLastSignalMs = 0;
 
 static bool isRelevantCanId(uint32_t canId);
 static void serviceTwaiAlerts();
+static void serviceBatteryPreheat(const RuntimeConfig& cfg);
+#ifdef ENABLE_CANB_MCP2515
+static bool canb_send(const can_frame& frame);
+#endif
 
 static bool twai_send(const can_frame& frame) {
+  if (canTxInhibitedForSleep) return false;
+  if (g_config.can1ReceiveOnly) return false;  // bus=1/TWAI/physical CANB RX-only
   if (frame.can_dlc > 8) return false;
 
   twai_message_t msg = {};
@@ -85,15 +396,21 @@ static bool twai_send(const can_frame& frame) {
 
   for (uint8_t attempt = 0; attempt <= TWAI_TX_RETRY_COUNT; ++attempt) {
     serviceTwaiAlerts();
-    if (twaiRecoveryInProgress) return false;
+    if (twaiRecoveryInProgress) {
+      g_status.can1TxFail++;
+      return false;
+    }
 
     if (twai_transmit(&msg, pdMS_TO_TICKS(TWAI_TX_WAIT_MS)) == ESP_OK) {
+      g_status.can1Tx++;
+      recordCanFrame(frame, 'T', 1);
       return true;
     }
 
     serviceTwaiAlerts();
     if (attempt < TWAI_TX_RETRY_COUNT) delay(TWAI_TX_RETRY_DELAY_MS);
   }
+  g_status.can1TxFail++;
   return false;
 }
 
@@ -103,14 +420,16 @@ static bool twai_recv(can_frame& frame) {
   for (uint8_t i = 0; i < TWAI_RX_SCAN_LIMIT; ++i) {
     TickType_t waitTicks = (i == 0) ? pdMS_TO_TICKS(TWAI_RX_WAIT_MS) : 0;
     if (twai_receive(&msg, waitTicks) != ESP_OK) return false;
-    if (msg.extd || msg.rtr || msg.data_length_code > 8 || !isRelevantCanId(msg.identifier)) {
+    if (msg.extd || msg.rtr || msg.data_length_code > 8) {
       continue;
     }
+    if (!isRelevantCanId(msg.identifier)) continue;
 
     frame.can_id  = msg.identifier;
     frame.can_dlc = msg.data_length_code;
     memset(frame.data, 0, sizeof(frame.data));
     memcpy(frame.data, msg.data, frame.can_dlc);
+    g_status.can1Rx++;
     return true;
   }
   return false;
@@ -122,6 +441,7 @@ static void serviceTwaiAlerts() {
     if (alerts & TWAI_ALERT_BUS_OFF) {
       if (!twaiRecoveryInProgress) {
         twaiRecoveryInProgress = true;
+        g_status.twaiBusOffCount++;
         twai_initiate_recovery();
       }
       return;
@@ -144,6 +464,7 @@ static void serviceTwaiAlerts() {
   if (statusInfo.state == TWAI_STATE_BUS_OFF) {
     if (!twaiRecoveryInProgress) {
       twaiRecoveryInProgress = true;
+      g_status.twaiBusOffCount++;
       twai_initiate_recovery();
     }
     return;
@@ -162,30 +483,178 @@ static void serviceTwaiAlerts() {
   if (statusInfo.state == TWAI_STATE_RUNNING) {
     twaiRecoveryInProgress = false;
   }
+  g_status.twaiState = static_cast<uint8_t>(statusInfo.state);
 }
 
 // ---- CAN IDs ----
 
 constexpr uint32_t CAN_ID_FOLLOW_DISTANCE = 1016;
 constexpr uint32_t CAN_ID_AP_CONTROL = 1021;
+constexpr uint32_t CAN_ID_UI_TRIP_PLANNING = 0x082;
+constexpr uint32_t CAN_ID_BMS_THERMAL_STATUS = 0x312;
+constexpr uint32_t CAN_ID_BMS_LOG1 = 0x374;
+constexpr uint32_t CAN_ID_BMS_PACK_TEMPERATURES = 0x712;
 constexpr uint32_t CAN_ID_DAS_STATUS = 0x399;
+constexpr uint32_t CAN_ID_BRAKE_PEDAL = 0x145;
+constexpr uint32_t CAN_ID_RCM_INERTIAL2_CH = 0x111;
+constexpr uint32_t CAN_ID_RCM_INERTIAL2_ETH = 0x116;
+constexpr uint32_t CAN_ID_DI_SYSTEM_STATUS = 0x118;
+constexpr uint32_t CAN_ID_DI_CHASSIS_CONTROL = 0x148;
+constexpr uint32_t CAN_ID_ESP_BRAKE_TORQUE = 0x185;
+constexpr uint32_t CAN_ID_DIF_TORQUE = 0x186;
+constexpr uint32_t CAN_ID_VEHICLE_SPEED = 0x257;
 
 static inline bool isRelevantCanId(uint32_t canId) {
-  return canId == CAN_ID_DAS_STATUS ||
+  return canId == CAN_ID_BRAKE_PEDAL ||
+         canId == CAN_ID_RCM_INERTIAL2_CH ||
+         canId == CAN_ID_RCM_INERTIAL2_ETH ||
+         canId == CAN_ID_DI_SYSTEM_STATUS ||
+         canId == CAN_ID_DI_CHASSIS_CONTROL ||
+         canId == CAN_ID_ESP_BRAKE_TORQUE ||
+         canId == CAN_ID_DIF_TORQUE ||
+         canId == CAN_ID_VEHICLE_SPEED ||
+         canId == CAN_ID_BMS_THERMAL_STATUS ||
+         canId == CAN_ID_BMS_LOG1 ||
+         canId == CAN_ID_BMS_PACK_TEMPERATURES ||
+         canId == CAN_ID_DAS_STATUS ||
          canId == CAN_ID_FOLLOW_DISTANCE ||
          canId == CAN_ID_AP_CONTROL;
 }
 
-// Hardware acceptance filter — a coarse pre-filter so the controller only
+// Battery-preheat 0x082 UI_tripPlanning. byte0 carries the active/nav/request
+// bits; byte1..7 are route/context fields that vary between captures. Keep a
+// valid vehicle frame as the template and only override byte0.
+static const uint8_t BATTERY_PREHEAT_FALLBACK[8] = {0x01, 0x50, 0xAC, 0x32, 0xFF, 0x03, 0x61, 0x15};
+constexpr uint32_t BATTERY_PREHEAT_PERIOD_MS = 200UL;
+static uint8_t batteryPreheatTemplate[8] = {0x01, 0x50, 0xAC, 0x32, 0xFF, 0x03, 0x61, 0x15};
+static bool batteryPreheatTemplateValid = false;
+static uint8_t batteryPreheatOffFramesLeft = 0;
+static uint32_t batteryPreheatLastRxMs = 0;
+static uint32_t bmsTempLastRxMs = 0;
+
+static int8_t signedByte(uint8_t raw) {
+  return raw >= 0x80 ? static_cast<int8_t>(static_cast<int>(raw) - 256) : static_cast<int8_t>(raw);
+}
+
+static void formatPayload8(const can_frame& frame, char out[24]) {
+  static const char hex[] = "0123456789ABCDEF";
+  uint8_t pos = 0;
+  const uint8_t n = frame.can_dlc < 8 ? frame.can_dlc : 8;
+  for (uint8_t i = 0; i < n; ++i) {
+    if (i != 0) out[pos++] = ' ';
+    out[pos++] = hex[(frame.data[i] >> 4) & 0x0F];
+    out[pos++] = hex[frame.data[i] & 0x0F];
+  }
+  out[pos] = '\0';
+}
+
+static bool isUsableBatteryPreheatContext(const can_frame& frame) {
+  if (frame.can_dlc < 8) return false;
+  const uint16_t energyRaw = (static_cast<uint16_t>(frame.data[7]) << 8) | frame.data[6];
+  return frame.data[1] != 0x7F &&
+         frame.data[2] != 0xFF &&
+         frame.data[3] != 0x80 &&
+         frame.data[3] != 0xFF &&
+         energyRaw != 0x8000 &&
+         energyRaw != 0x8001 &&
+         energyRaw != 0xFFFF;
+}
+
+static void cacheBatteryPreheatTemplate(const can_frame& frame) {
+  batteryPreheatLastRxMs = millis();
+  g_status.batteryPreheatVehicleSeen = 1;
+  g_status.batteryPreheatUiTripActive = frame.data[0] & 0x01;
+  g_status.batteryPreheatUiNavToSupercharger = (frame.data[0] >> 1) & 0x01;
+  g_status.batteryPreheatUiFastChargerType = (frame.data[0] >> 2) & 0x07;
+  g_status.batteryPreheatUiState = (frame.data[0] >> 5) & 0x03;
+  g_status.batteryPreheatUiRequestHeat = (frame.data[0] >> 7) & 0x01;
+  g_status.batteryPreheatUiPowerW = frame.data[1] == 0x7F ? -32768 : static_cast<int>(signedByte(frame.data[1])) * 125;
+  g_status.batteryPreheatUiTargetCx100 = frame.data[2] == 0xFF ? -32768 : static_cast<int>(frame.data[2]) * 25;
+  g_status.batteryPreheatUiAmbientCx100 =
+      (frame.data[3] == 0x80 || frame.data[3] == 0xFF) ? -32768 : static_cast<int>(signedByte(frame.data[3])) * 50;
+  const uint16_t chargeTargetRaw = (static_cast<uint16_t>(frame.data[5] & 0x03) << 8) | frame.data[4];
+  const uint16_t energyRaw = (static_cast<uint16_t>(frame.data[7]) << 8) | frame.data[6];
+  g_status.batteryPreheatUiChargeTargetCx10 = chargeTargetRaw == 0x03FF ? -32768 : static_cast<int>(chargeTargetRaw);
+  g_status.batteryPreheatUiEnergyAtDestination =
+      (energyRaw == 0x8000 || energyRaw == 0x8001 || energyRaw == 0xFFFF) ? -32768 : static_cast<int>(static_cast<int16_t>(energyRaw));
+  if (!isUsableBatteryPreheatContext(frame)) return;
+  memcpy(batteryPreheatTemplate, frame.data, 8);
+  batteryPreheatTemplate[0] = 0x01;
+  batteryPreheatTemplateValid = true;
+  g_status.batteryPreheatTemplateValid = 1;
+}
+
+static void makeBatteryPreheatPayload(uint8_t payload[8], bool enabled) {
+  memcpy(payload,
+         batteryPreheatTemplateValid ? batteryPreheatTemplate : BATTERY_PREHEAT_FALLBACK,
+         8);
+  payload[0] = enabled ? 0xAF : 0x01;
+}
+
+static void sendBatteryPreheatFrame(const uint8_t payload[8]) {
+  can_frame f = {};
+  f.can_id = CAN_ID_UI_TRIP_PLANNING;
+  f.can_dlc = 8;
+  memcpy(f.data, payload, 8);
+#ifdef ENABLE_CANB_MCP2515
+  canb_send(f);
+#else
+  twai_send(f);
+#endif
+}
+
+static void serviceBatteryPreheat(const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+
+#ifdef ENABLE_CANB_MCP2515
+  if (!cfg.canbEnabled) {
+    g_status.batteryPreheatActive = 0;
+    batteryPreheatLastSendMs = 0;
+    batteryPreheatOffFramesLeft = 0;
+    return;
+  }
+#endif
+
+  if (!cfg.batteryPreheatEnabled) {
+    g_status.batteryPreheatActive = 0;
+    // On the OFF edge, emit a few OFF frames (~1000 ms apart) so the request clears.
+    if (batteryPreheatOffFramesLeft > 0) {
+      if (batteryPreheatLastSendMs == 0 ||
+          (now - batteryPreheatLastSendMs) >= BATTERY_PREHEAT_PERIOD_MS) {
+        batteryPreheatLastSendMs = now;
+        uint8_t payload[8];
+        makeBatteryPreheatPayload(payload, false);
+        sendBatteryPreheatFrame(payload);
+        batteryPreheatOffFramesLeft--;
+      }
+    } else {
+      batteryPreheatLastSendMs = 0;
+    }
+    return;
+  }
+
+  g_status.batteryPreheatActive = 1;
+  batteryPreheatOffFramesLeft = 3;  // arm OFF frames for the next disable edge
+  if (batteryPreheatLastSendMs != 0 &&
+      (now - batteryPreheatLastSendMs) < BATTERY_PREHEAT_PERIOD_MS) {
+    return;
+  }
+  batteryPreheatLastSendMs = now;
+  uint8_t payload[8];
+  makeBatteryPreheatPayload(payload, true);
+  sendBatteryPreheatFrame(payload);
+}
+
+// CAN A 璋冭瘯瑕佺偣锛?// TWAI 纭欢杩囨护鍙仛鈥滅矖杩囨护鈥濓紝鍑忓皯鎬荤嚎甯ц繘鍏?RX 闃熷垪鐨勬暟閲忥紱
+// 鐪熸鍙備笌涓氬姟閫昏緫鐨勪粛鐒跺彧鍏佽 0x399銆?x3F8銆?x3FD 涓変釜 ID銆?// Hardware acceptance filter 鈥?a coarse pre-filter so the controller only
 // enqueues the IDs near our targets instead of the whole bus; isRelevantCanId()
-// still does the exact 3-ID match. Derived from the only IDs we touch:
-//   0x399 (921), 0x3F8 (1016), 0x3FD (1021).
-// Their common must-match bits give acceptance code 0x398; the differing ID
-// bits {0,2,5,6} (mask 0x79A marks the must-match bits) are "don't care", so
-// exactly 16 IDs in 0x398..0x3FD pass. Standard 11-bit IDs sit in bits [31:21];
+// still does the exact ID match. Derived from the IDs we touch:
+//   0x145, 0x399, 0x3F8, 0x3FD.
+// Adding 0x145 widens this coarse filter; software filtering above still drops
+// every unrelated ID. Standard 11-bit IDs sit in bits [31:21];
 // in twai_filter_config_t a mask bit of 1 means "don't care".
-constexpr uint32_t CAN_ACCEPT_CODE = static_cast<uint32_t>(0x398) << 21;
-constexpr uint32_t CAN_ACCEPT_MASK = ~(static_cast<uint32_t>(0x79A) << 21);
+constexpr uint32_t CAN_ACCEPT_CODE = 0;
+constexpr uint32_t CAN_ACCEPT_MASK = 0xFFFFFFFF;
 
 // ---- Unified speed compensation ----
 
@@ -203,6 +672,7 @@ struct SpeedLimitMonitor {
 
   void update(const can_frame& frame) {
     if (frame.can_id == CAN_ID_DAS_STATUS && frame.can_dlc >= 2) {
+    // 0x399 淇濆瓨鏈€杩戜竴娆?DAS 鐘舵€佸抚锛涢€熷害鍋忕Щ璁＄畻鍙缂撳瓨锛屼笉鍦?CAN 蹇矾寰勯噷鍋氶噸娲汇€?    if (frame.can_id == CAN_ID_DAS_STATUS && frame.can_dlc >= 2) {
       dasStatusFrame = frame;
       hasDasStatusFrame = true;
     }
@@ -211,6 +681,7 @@ struct SpeedLimitMonitor {
   bool getFusedSpeedLimitValue(int& limitValue) const {
     if (!hasDasStatusFrame || dasStatusFrame.can_dlc < 2) return false;
     const uint64_t fusedLimitRaw = (static_cast<uint64_t>(dasStatusFrame.data[1]) & 0x1F);
+    // 浣?5 bit 涓鸿瀺鍚堥檺閫熺储寮曪紝鍗曚綅 5 km/h锛? 鍜?31 瑙嗕负鏃犳晥/鏈煡銆?    const uint64_t fusedLimitRaw = (static_cast<uint64_t>(dasStatusFrame.data[1]) & 0x1F);
     if (fusedLimitRaw == 0 || fusedLimitRaw == 31) return false;
     limitValue = static_cast<int>(fusedLimitRaw * 5ULL);
     return true;
@@ -218,6 +689,12 @@ struct SpeedLimitMonitor {
 };
 
 SpeedLimitMonitor speedLimitMonitor;
+
+#ifdef ENABLE_CANB_MCP2515
+static void handleRearFogPedalBrakeEdge(bool brakeActive, const RuntimeConfig& cfg);
+static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& cfg);
+static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg);
+#endif
 
 // ---- Bit-level helpers ----
 
@@ -240,16 +717,20 @@ inline int clampOffsetKph(int value) { return std::max(std::min(value, MAX_SPEED
 
 inline uint8_t encodeSpeedOffsetRawPct4(int offsetKph, int fusedSpeedLimitKph) {
   if (fusedSpeedLimitKph <= 0) return 0;
+  // 閫熷害鍋忕Щ鍦?CAN 绾夸笂鎸?PCT4 缂栫爜锛?% = 4 raw銆?  if (fusedSpeedLimitKph <= 0) return 0;
   int pct = (offsetKph * 100 + fusedSpeedLimitKph / 2) / fusedSpeedLimitKph;
   pct = std::max(std::min(pct, MAX_SPEED_OFFSET_PCT), 0);
   return static_cast<uint8_t>(pct * OFFSET_PCT4_RAW_PER_PCT);
 }
 
-inline int getTargetSpeedForLimit(int fusedSpeedLimitValue) {
-  if (fusedSpeedLimitValue < 60)  return AUTO_TARGET_SPEED;
-  if (fusedSpeedLimitValue < 80)  return AUTO_TARGET_SPEED_AT_80;
-  if (fusedSpeedLimitValue < 100) return AUTO_TARGET_SPEED_AT_100;
-  if (fusedSpeedLimitValue < 120) return AUTO_TARGET_SPEED_AT_120;
+inline int getTargetSpeedForLimit(int fusedSpeedLimitValue, const RuntimeConfig& cfg) {
+  if (fusedSpeedLimitValue < 60)  return cfg.targetBelow60;
+  if (fusedSpeedLimitValue < 70)  return cfg.target60;
+  if (fusedSpeedLimitValue < 80)  return cfg.target70;
+  if (fusedSpeedLimitValue < 90)  return cfg.target80;
+  if (fusedSpeedLimitValue < 100) return cfg.target90;
+  if (fusedSpeedLimitValue < 120) return cfg.target100;
+  if (fusedSpeedLimitValue < 140) return cfg.target120;
   return fusedSpeedLimitValue;
 }
 
@@ -259,6 +740,7 @@ inline uint8_t readSpeedOffsetRaw(const can_frame& frame) {
 
 inline void writeSpeedOffsetRaw(can_frame& frame, uint8_t raw) {
   frame.data[0] = static_cast<uint8_t>((frame.data[0] & ~0xC0) | ((raw & 0x03) << 6));
+  // 0x3FD mux 2 鐨?offset raw 璺?data[0] bit6-7 鍜?data[1] bit0-5銆?  frame.data[0] = static_cast<uint8_t>((frame.data[0] & ~0xC0) | ((raw & 0x03) << 6));
   frame.data[1] = static_cast<uint8_t>((frame.data[1] & ~0x3F) | (raw >> 2));
 }
 
@@ -266,13 +748,15 @@ struct OffsetSlewLimiter {
   uint8_t lastRaw = 0;
   uint32_t lastSentMs = 0;
 
-  uint8_t apply(uint8_t targetRaw) {
+  uint8_t apply(uint8_t targetRaw, uint8_t slewPctPerSec) {
     uint8_t shapedRaw = targetRaw;
     const uint32_t now = millis();
 
     if (targetRaw < lastRaw && lastSentMs != 0) {
       const uint32_t rateRawPerSec =
-        static_cast<uint32_t>(OFFSET_SLEW_RATE_PCT_PER_SEC) * OFFSET_PCT4_RAW_PER_PCT;
+        static_cast<uint32_t>(slewPctPerSec) * OFFSET_PCT4_RAW_PER_PCT;
+      // 鍙檺鍒垛€滀笅闄嶉€熷害鈥濓細闄愰€熺獊鐒堕檷浣庢椂骞虫粦鍥炶惤锛岄伩鍏嶇洰鏍囬€熷害鐬棿璺冲彉銆?      const uint32_t rateRawPerSec =
+        static_cast<uint32_t>(slewPctPerSec) * OFFSET_PCT4_RAW_PER_PCT;
       const uint32_t elapsedMs = now - lastSentMs;
       const uint32_t maxDrop = (rateRawPerSec * elapsedMs + 500U) / 1000U;
       const uint8_t floorRaw = lastRaw > maxDrop ? static_cast<uint8_t>(lastRaw - maxDrop) : 0;
@@ -289,37 +773,54 @@ struct OffsetSlewLimiter {
 
 struct HW3Handler {
   int speedProfile = 1;
-  bool FSDEnabled = true;
   UnifiedSpeedCompensationPort unifiedSpeedCompensation{};
   OffsetSlewLimiter offsetSlewLimiter{};
 
-  void refreshUnifiedSpeedCompensation() {
+  void refreshUnifiedSpeedCompensation(const RuntimeConfig& cfg) {
     unifiedSpeedCompensation.hasFusedSpeedLimit = false;
+    // 姣忚疆鏀跺埌鐩稿叧 CAN A 甯у悗鍒锋柊涓€娆＄紦瀛樼姸鎬侊紝鍚庣画 mux 2 鐩存帴鍐欏叆璁＄畻濂界殑 offset銆?    unifiedSpeedCompensation.hasFusedSpeedLimit = false;
     unifiedSpeedCompensation.fusedSpeedLimitKph = 0;
     unifiedSpeedCompensation.targetSpeedKph = 0;
     unifiedSpeedCompensation.offsetKph = 0;
     unifiedSpeedCompensation.speedOffsetRaw = 0;
-    if (enableAutoOffsetFromFusedSpeedLimit) {
+    if (cfg.autoSpeedOffsetEnabled) {
       int fusedSpeedLimitValue = 0;
       if (speedLimitMonitor.getFusedSpeedLimitValue(fusedSpeedLimitValue)) {
         unifiedSpeedCompensation.hasFusedSpeedLimit = true;
         unifiedSpeedCompensation.fusedSpeedLimitKph = fusedSpeedLimitValue;
-        unifiedSpeedCompensation.targetSpeedKph = getTargetSpeedForLimit(fusedSpeedLimitValue);
+        unifiedSpeedCompensation.targetSpeedKph = getTargetSpeedForLimit(fusedSpeedLimitValue, cfg);
         int desiredOffsetKph = unifiedSpeedCompensation.targetSpeedKph > fusedSpeedLimitValue
           ? (unifiedSpeedCompensation.targetSpeedKph - fusedSpeedLimitValue)
           : 0;
+        // 鐩爣閫熷害琛ㄧ敱 WebUI 閰嶇疆锛涙渶缁?offset 浠嶅彈 MAX_SPEED_OFFSET_KPH/PCT 涓婇檺淇濇姢銆?        int desiredOffsetKph = unifiedSpeedCompensation.targetSpeedKph > fusedSpeedLimitValue
         unifiedSpeedCompensation.offsetKph = clampOffsetKph(desiredOffsetKph);
-        unifiedSpeedCompensation.speedOffsetRaw = encodeSpeedOffsetRawPct4(
-          unifiedSpeedCompensation.offsetKph,
-          unifiedSpeedCompensation.fusedSpeedLimitKph);
+        unifiedSpeedCompensation.speedOffsetRaw =
+          fusedSpeedLimitValue < LOW_SPEED_MAX_PCT_LIMIT_KPH
+            ? cfg.lowSpeedMaxPctRaw
+            : encodeSpeedOffsetRawPct4(
+                unifiedSpeedCompensation.offsetKph,
+                unifiedSpeedCompensation.fusedSpeedLimitKph);
       }
     }
+
+    g_status.fusedLimitKph = unifiedSpeedCompensation.fusedSpeedLimitKph;
+    g_status.targetSpeedKph = unifiedSpeedCompensation.targetSpeedKph;
+    g_status.offsetKph = unifiedSpeedCompensation.offsetKph;
   }
 
-  void handelMessage(can_frame& frame) {
+  void handelMessage(can_frame& frame, const RuntimeConfig& cfg) {
+#ifdef ENABLE_CANB_MCP2515
+    handleRearFogCanADecelFrame(frame, cfg);
+#endif
+    if (frame.can_id == CAN_ID_BRAKE_PEDAL) {
+      if (frame.can_dlc < 4) return;
+      return;
+    }
+
     if (frame.can_id == CAN_ID_FOLLOW_DISTANCE) {
       if (frame.can_dlc < 6) return;
       uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
+      // 0x3F8 璺熻溅璺濈鎷ㄦ潌澶嶇敤涓洪┚椹堕鏍硷細鏁板€艰秺灏忚秺婵€杩涖€?      uint8_t followDistance = (frame.data[5] & 0b11100000) >> 5;
       switch (followDistance) {
         case 1: speedProfile = 2; break;
         case 2: speedProfile = 1; break;
@@ -330,20 +831,24 @@ struct HW3Handler {
     if (frame.can_id == CAN_ID_AP_CONTROL) {
       if (frame.can_dlc < 8) return;
       auto index = readMuxID(frame);
-      if (index == 0 && FSDEnabled) {
+      if (index == 0 && cfg.fsdEnabled) {
         setBit(frame, 46, true);
+        // 0x3FD mux 0锛氬紑鍚?FSD/AP 鐩稿叧 bit锛屽苟鍐欏叆褰撳墠椹鹃┒椋庢牸銆?        setBit(frame, 46, true);
         setSpeedProfileV12V13(frame, speedProfile);
         twai_send(frame);
       }
       if (index == 1) {
         setBit(frame, 19, false);
+        // 0x3FD mux 1锛氭竻 bit 19锛屾部鐢ㄥ師鍒嗘敮鐨?AP/FSD 婵€娲昏緟鍔╅€昏緫銆?        setBit(frame, 19, false);
         twai_send(frame);
       }
-      if (index == 2 && FSDEnabled) {
+      if (index == 2 && cfg.fsdEnabled) {
         uint8_t speedOffsetRaw = unifiedSpeedCompensation.hasFusedSpeedLimit
           ? unifiedSpeedCompensation.speedOffsetRaw
           : readSpeedOffsetRaw(frame);
-        speedOffsetRaw = offsetSlewLimiter.apply(speedOffsetRaw);
+        // 0x3FD mux 2锛氬啓鍏ラ€熷害鍋忕Щ銆傝嫢娌℃湁鏈夋晥闄愰€燂紝鍒欎繚鐣欏師杞﹀綋鍓?offset銆?        uint8_t speedOffsetRaw = unifiedSpeedCompensation.hasFusedSpeedLimit
+        speedOffsetRaw = offsetSlewLimiter.apply(speedOffsetRaw, cfg.slewPctPerSec);
+        g_status.offsetRaw = speedOffsetRaw;
         writeSpeedOffsetRaw(frame, speedOffsetRaw);
         twai_send(frame);
       }
@@ -351,39 +856,1800 @@ struct HW3Handler {
   }
 };
 
-// ---- Main ----
-
 HW3Handler handler;
+
+// ============================================================================
+// CAN B (MCP2515) secondary bus 鈥?basic comms + non-blocking service-mode burst
+// ============================================================================
+#ifdef ENABLE_CANB_MCP2515
+
+static MCP2515 canb(MCP2515_CS);
+static bool canbReady = false;
+static uint8_t canbHardwareFilterMode = CANB_FILTER_ALL;
+static uint32_t canbRxCount = 0;
+static uint32_t canbTxCount = 0;
+static uint32_t canbTxFailCount = 0;
+static uint32_t canbLastId = 0;
+static uint32_t canbRxOverflowCount = 0;
+
+// 0x339 VCSEC service-mode burst state (RAM-only, OFF on boot). Each toggle
+// queues 4 frames at 10ms spacing, scheduled with millis() 鈥?never delay().
+// volatile: setCanBServiceMode() may run on the WebUI task (core 0) while
+// serviceCanBScheduledTx() runs on the CAN loop (core 1).
+static volatile bool canbServiceModeActive = false;
+static volatile uint8_t canbServiceBurstRemaining = 0;
+static volatile uint8_t canbServiceBurstByte5 = 0;
+static volatile uint32_t canbLastServiceBurstMs = 0;
+
+// CAN B feature IDs:
+//   0x249: SCCMLeftStalk command. status=1 PULL triggers high-light strobe;
+//          injected strobe uses only status=1 PULL and status=0 idle.
+//   0x229: SCCM_rightStalk. Captured D/R request source on bus2; optional
+//          experimental scroll-to-gear injection uses this frame.
+//   0x273: body lighting frame used for brake/fog context and rear-fog strobe.
+//   0x3F5: lighting feedback frame; accepted by the hardware filter for logging.
+constexpr uint32_t CANB_ID_SCCM_RIGHT_STALK = 0x229;
+constexpr uint32_t CANB_ID_STW_ACTN_RQ = 0x249;
+constexpr uint32_t CANB_ID_BODY_LIGHTING = 0x273;
+constexpr uint32_t CANB_ID_VCSEC_STATUS = 0x339;
+constexpr uint32_t CANB_ID_LIGHTING_STATUS = 0x3F5;
+// 0x3C2 VCLEFT_switchStatus: byte0 bit3 = hazardButtonPressed; data[3] bits0..5
+// = VCLEFT_swcRightScrollTicks (6-bit signed, + forward / - back).
+constexpr uint32_t CANB_ID_VCLEFT_SWITCH = 0x3C2;
+constexpr uint8_t HIGH_BEAM_STROBE_PULSES = 8;
+constexpr uint8_t REAR_FOG_PEDAL_STROBE_PULSES = 3;
+constexpr uint8_t REAR_FOG_BODY_STROBE_PULSES = 6;
+constexpr uint8_t REVERSE_STROBE_PULSES = 4;
+constexpr uint8_t REAR_FOG_PRIORITY_PEDAL = 1;
+constexpr uint8_t REAR_FOG_PRIORITY_BODY = 2;
+constexpr uint8_t REAR_FOG_PRIORITY_REVERSE = 3;
+constexpr uint16_t HIGH_BEAM_STROBE_INTERVAL_MS = 75;
+constexpr uint16_t HIGH_BEAM_STROBE_RESEND_MS = 45;
+constexpr uint16_t REAR_FOG_STROBE_INTERVAL_MS = 135;
+// Hazard (0x3C2 bit3) is a momentary TOGGLE button: one click toggles hazards
+// on/off. Reverse = one click ON -> hold REVERSE_HAZARD_ON_MS (car flashes
+// continuously) -> one click OFF. (Pulsing it would just toggle on/off/on/off.)
+constexpr uint16_t REVERSE_HAZARD_CLICK_MS = 200;   // length of one button "press"
+constexpr uint16_t REVERSE_HAZARD_ON_MS = 2500;     // hazards stay on ~2.5s of continuous flashing
+constexpr uint16_t REAR_FOG_MILD_DECEL_HOLD_MS = 300;
+constexpr uint16_t REAR_FOG_HARD_DECEL_HOLD_MS = 150;
+constexpr uint16_t REAR_FOG_DECEL_RECENT_MS = 800;
+constexpr uint16_t SCROLL_GEAR_BRAKE_HOLD_MS = 150;
+constexpr uint16_t SCROLL_GEAR_FRAME_INTERVAL_MS = 50;  // ~20Hz, matches/dominates real 0x229 (10Hz)
+constexpr uint16_t SCROLL_GEAR_IDLE_FRAMES = 3;
+constexpr uint16_t SCROLL_GEAR_STATUS_FRAMES = 6;        // sustain detent longer (manual D=5,R=~7 frames)
+constexpr uint16_t SCROLL_GEAR_COOLDOWN_MS = 400;  // 连续 R<->D 更跟手(单次换挡本身仅~0.1-0.3s)
+constexpr float SCROLL_GEAR_MAX_SPEED_KPH = 2.0f;
+constexpr float REAR_FOG_MILD_DECEL_THRESHOLD = -0.80f;
+constexpr float REAR_FOG_HARD_DECEL_THRESHOLD = -2.50f;
+constexpr float REAR_FOG_VERY_HARD_DECEL_THRESHOLD = -3.50f;
+constexpr uint16_t HIGH_BEAM_DOUBLE_PULL_WINDOW_MS = 1200;
+constexpr uint8_t STALK_STATUS_IDLE = 0;
+constexpr uint8_t STALK_STATUS_PULL = 1;
+constexpr uint8_t STALK_TURN_IDLE = 0;
+constexpr uint8_t STALK_TURN_HAZARD = 6;
+constexpr uint8_t RIGHT_STALK_IDLE = 0;
+constexpr uint8_t RIGHT_STALK_R_STAGE1 = 1;
+constexpr uint8_t RIGHT_STALK_R_STAGE2 = 2;
+constexpr uint8_t RIGHT_STALK_D_STAGE1 = 3;
+constexpr uint8_t RIGHT_STALK_D_STAGE2 = 4;
+constexpr uint8_t GEAR_R = 2;
+constexpr uint8_t GEAR_D = 4;
+constexpr uint8_t VCLEFT_HAZARD_BUTTON_MASK = 0x08;  // 0x3C2 byte0 bit3
+// 0x3C2 is multiplexed by byte0 bits0..1. Capture: mux0 carries hazardButton +
+// counter/CRC (data[3] is 0x55 filler); mux1 carries rightScrollTicks in data[3]
+// (6-bit signed, idle 0). Reading data[3] without checking the mux misreads
+// mux0's 0x55 as +21 ticks.
+constexpr uint8_t VCLEFT_MUX_MASK = 0x03;
+constexpr uint8_t VCLEFT_MUX_HAZARD = 0x00;  // mux0: hazard button
+constexpr uint8_t VCLEFT_MUX_SCROLL = 0x01;  // mux1: right scroll ticks
+constexpr uint8_t REAR_FOG_MASK = 0x80;
+constexpr uint8_t REAR_FOG_OFF = 0x10;
+constexpr uint8_t REAR_FOG_ON = 0x90;
+static can_frame canbLastStwActnRqFrame{};
+static bool canbHasLastStwActnRqFrame = false;
+static can_frame canbLastRightStalkFrame{};
+static bool canbHasLastRightStalkFrame = false;
+static volatile uint8_t rightStalkTxCounter = 0;
+static can_frame canbLastBodyLightingFrame{};
+static bool canbHasLastBodyLightingFrame = false;
+static can_frame canbLastVcleftSwitchFrame{};
+static bool canbHasLastVcleftSwitchFrame = false;
+static can_frame canbLastVcleftMux0Frame{};      // last 0x3C2 mux0 frame (hazard + counter/CRC)
+static bool canbHasLastVcleftMux0Frame = false;
+static volatile uint8_t highBeamStalkLastCounter = 0;
+
+static volatile bool highBeamStrobeActive = false;
+// Non-blocking light-effect state. loop() only emits frames when millis() reaches
+// the next phase edge, so CAN A / FSD activation never waits on a delay().
+static volatile bool highBeamStrobeManualTrigger = false;
+static volatile bool highBeamStrobeOutputOn = false;
+static volatile uint8_t highBeamStrobePulsesRemaining = 0;
+static volatile uint32_t highBeamStrobeLastToggleMs = 0;
+static volatile uint32_t highBeamStrobeLastSendMs = 0;
+static bool highBeamLastPullDown = false;
+static uint8_t highBeamPullCount = 0;
+static uint32_t highBeamLastPullMs = 0;
+static volatile bool rearFogBrakeStrobeActive = false;
+static volatile bool rearFogBrakeStrobeManualTrigger = false;
+static volatile bool rearFogBrakeStrobeOutputOn = false;
+static volatile uint8_t rearFogBrakeStrobePulsesRemaining = 0;
+static volatile uint8_t rearFogBrakeStrobePriority = 0;
+static volatile uint32_t rearFogBrakeStrobeLastToggleMs = 0;
+static bool rearFogLastPedalBrakeActive = false;
+static bool rearFogLastBrakeActive = false;
+static uint32_t rearFogRecentPedalBrakeUntilMs = 0;
+static uint32_t rearFogRecentBrakeLampUntilMs = 0;
+static uint32_t rearFogRecentBrakeTorqueUntilMs = 0;
+static uint32_t rearFogRecentRegenUntilMs = 0;
+static uint32_t rearFogRecentNegTorqueUntilMs = 0;
+static uint32_t rearFogRecentSpeedFallingUntilMs = 0;
+static uint32_t rearFogMildDecelStartMs = 0;
+static uint32_t rearFogHardDecelStartMs = 0;
+static bool rearFogMildDecelTriggered = false;
+static bool rearFogHardDecelTriggered = false;
+static float rearFogLastVehicleSpeedKph = -1.0f;
+static volatile bool reverseStrobeActive = false;
+static volatile uint8_t reverseStrobePhase = 0;       // 0 idle, 1 ON-press, 2 hold(flashing), 3 OFF-press
+static volatile uint32_t reverseStrobePhaseEnd = 0;
+static volatile bool reverseHazardLatchedOn = false;  // true after our ON click until the matching OFF click is sent
+static uint8_t lastDIGearRaw = 0;
+static volatile bool g_brakePedalActive = false;
+static volatile uint32_t g_brakePedalActiveSinceMs = 0;
+static volatile float g_vehicleSpeedKph = 0.0f;
+static volatile bool g_vehicleSpeedValid = false;
+static volatile bool scrollGearShiftActive = false;
+static volatile uint8_t scrollGearTargetGear = 0;
+static volatile uint8_t scrollGearPhaseIndex = 0;
+static volatile uint8_t scrollGearIdleFramesRemaining = 0;
+static volatile uint32_t scrollGearNextTxMs = 0;
+static volatile uint32_t scrollGearCooldownUntilMs = 0;
+static volatile bool scrollGearLatched = false;
+static volatile uint8_t scrollGearLastBlocked = 0;
+
+// CAN B read budget per loop pass 鈥?bounded so it can never starve CAN A.
+constexpr uint8_t CANB_RX_SCAN_LIMIT = 4;
+constexpr uint8_t CANB_RX_SCAN_LIMIT_ACTIVE = 24;
+constexpr uint32_t CANB_RX_DRAIN_TIME_US = 900;
+
+static void setupCanB();
+static bool applyCanBFilters(uint8_t mode);
+static bool canb_recv(can_frame& frame);
+static bool canb_send(const can_frame& frame);
+static void drainCanBWithBudget();
+static void updateCanBErrorStatus();
+static void handleCanBFrame(const can_frame& frame);
+static void setCanBServiceMode(bool enabled);
+static void serviceCanBScheduledTx();
+static void serviceHighBeamStrobe(const RuntimeConfig& cfg);
+static void serviceReverseStrobe(const RuntimeConfig& cfg);
+static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg);
+static void serviceScrollGearShift(const RuntimeConfig& cfg);
+static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig& cfg, bool cacheHazardFrame);
+static void serviceLockDeepSleep();
+
+static void setupCanB() {
+  canbReady = false;
+  pinMode(MCP2515_INT, INPUT_PULLUP);
+
+  // Hard reset the MCP2515 via its RST line: high / low / high.
+  pinMode(MCP2515_RST, OUTPUT);
+  digitalWrite(MCP2515_RST, HIGH);
+  delay(10);
+  digitalWrite(MCP2515_RST, LOW);
+  delay(10);
+  digitalWrite(MCP2515_RST, HIGH);
+  delay(10);
+
+  SPI.begin(MCP2515_SCK, MCP2515_MISO, MCP2515_MOSI, MCP2515_CS);
+
+  // reset()/setNormalMode() return types vary across library versions, so we
+  // call them as statements and only gate on setBitrate(), which is the
+  // meaningful failure point. A failure here just leaves canbReady = false; it
+  // must never block or disturb CAN A / the FSD pipeline.
+  canb.reset();
+  delay(10);
+  if (canb.setBitrate(CAN_500KBPS, MCP2515_CLOCK) != MCP2515::ERROR_OK) return;
+  if (!applyCanBFilters(configSnapshot().canbFilterMode)) return;
+  canbReady = true;
+}
+
+static bool applyCanBFilters(uint8_t mode) {
+  if (mode > CANB_FILTER_MINIMUM) mode = CANB_FILTER_ALL;
+  if (mode == CANB_FILTER_FEATURE) {
+    if (canb.setFilterMask(MCP2515::MASK0, false, 0x7FF) != MCP2515::ERROR_OK) return false;
+    // WebUI 寮€鍚繃婊わ細MCP2515 鍙帴鏀跺綋鍓嶅姛鑳界浉鍏虫爣鍑嗗抚锛岄檷浣?CAN B 澶勭悊鍘嬪姏銆?    if (canb.setFilterMask(MCP2515::MASK0, false, 0x7FF) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF0, false, CANB_ID_STW_ACTN_RQ) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF1, false, CANB_ID_BODY_LIGHTING) != MCP2515::ERROR_OK) return false;
+
+    if (canb.setFilterMask(MCP2515::MASK1, false, 0x7FF) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_VCSEC_STATUS) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_SCCM_RIGHT_STALK) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF4, false, CAN_ID_UI_TRIP_PLANNING) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
+  } else if (mode == CANB_FILTER_MINIMUM) {
+    if (canb.setFilterMask(MCP2515::MASK0, false, 0x7FF) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF0, false, CANB_ID_STW_ACTN_RQ) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF1, false, CANB_ID_BODY_LIGHTING) != MCP2515::ERROR_OK) return false;
+
+    if (canb.setFilterMask(MCP2515::MASK1, false, 0x7FF) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_SCCM_RIGHT_STALK) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF4, false, CAN_ID_UI_TRIP_PLANNING) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCSEC_STATUS) != MCP2515::ERROR_OK) return false;
+  } else {
+    if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
+    // WebUI 鍏抽棴杩囨护锛歮ask=0 鎺ユ敹鍏ㄩ儴鏍囧噯甯э紝鏂逛究瀹炶溅鎶撳寘/璋冭瘯鏂?ID銆?    if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF0, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF1, false, 0x000) != MCP2515::ERROR_OK) return false;
+
+    if (canb.setFilterMask(MCP2515::MASK1, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF2, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF3, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF4, false, 0x000) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF5, false, 0x000) != MCP2515::ERROR_OK) return false;
+  }
+
+  if (canb.setNormalMode() != MCP2515::ERROR_OK) return false;
+  canbHardwareFilterMode = mode;
+  return true;
+}
+
+static bool canb_recv(can_frame& frame) {
+  if (!canbReady) return false;
+  if (canb.readMessage(&frame) != MCP2515::ERROR_OK) return false;
+
+  // Stage 1: ignore extended and remote frames; clamp DLC defensively.
+  if (frame.can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG)) return false;
+  frame.can_id &= CAN_SFF_MASK;
+  if (frame.can_dlc > 8) frame.can_dlc = 8;
+
+  canbRxCount++;
+  canbLastId = frame.can_id;
+  g_status.canbRx = canbRxCount;
+  g_status.canbLastId = canbLastId;
+  recordCanFrame(frame, 'R', 2);
+  return true;
+}
+
+static bool canb_send(const can_frame& frame) {
+  if (canTxInhibitedForSleep) return false;
+  if (!canbReady) return false;
+  if (frame.can_dlc > 8) return false;
+  // One short retry on a busy/failed mailbox; no blocking delay so a stuck
+  // CAN B can never stall CAN A.
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    if (canb.sendMessage(&frame) == MCP2515::ERROR_OK) {
+      canbTxCount++;
+      g_status.canbTx = canbTxCount;
+      recordCanFrame(frame, 'T', 2);
+      return true;
+    }
+  }
+  canbTxFailCount++;
+  g_status.canbTxFail = canbTxFailCount;
+  return false;
+}
+
+static void updateCanBErrorStatus() {
+  if (!canbReady) return;
+  const uint8_t flags = canb.getErrorFlags();
+  g_status.canbErrorFlags = flags;
+  if (flags & (MCP2515::EFLG_RX0OVR | MCP2515::EFLG_RX1OVR)) {
+    canbRxOverflowCount++;
+    g_status.canbRxOverflowCount = canbRxOverflowCount;
+    canb.clearRXnOVRFlags();
+  }
+}
+
+static uint8_t readStalkStatus(const can_frame& frame) {
+  if (frame.can_dlc < 2) return STALK_STATUS_IDLE;
+  return static_cast<uint8_t>((frame.data[1] >> 4) & 0x03);
+}
+
+static uint8_t stalkCrc249(uint8_t counter, uint8_t status) {
+  static const uint8_t base[16] = {
+    0x9B, 0xE8, 0x2A, 0xD3, 0xD3, 0x83, 0x4C, 0x5E,
+    0x3F, 0x5E, 0xE2, 0x28, 0x3A, 0x13, 0xAF, 0xCE
+  };
+  static const uint8_t offset[8] = {0x00, 0x76, 0xEC, 0x00, 0xF7, 0x00, 0x00, 0x00};
+  return static_cast<uint8_t>(base[counter & 0x0F] ^ offset[status & 0x07]);
+}
+
+static can_frame highBeamFrame(uint8_t status) {
+  can_frame f = {};
+  f.can_id = CANB_ID_STW_ACTN_RQ;
+  f.can_dlc = 4;
+  const uint8_t counter = static_cast<uint8_t>((highBeamStalkLastCounter + 1) & 0x0F);
+  f.data[0] = stalkCrc249(counter, status);
+  f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
+  highBeamStalkLastCounter = counter;
+  return f;
+}
+
+static void setBrakePedalActive(bool active) {
+  const uint32_t now = millis();
+  if (active && !g_brakePedalActive) g_brakePedalActiveSinceMs = now;
+  if (!active) g_brakePedalActiveSinceMs = 0;
+  g_brakePedalActive = active;
+  g_status.brakeActive = active ? 1 : 0;
+}
+
+static uint8_t rightStalkCrc229(uint8_t counter, uint8_t status) {
+  static const uint8_t base[16] = {
+    0x46, 0x44, 0x52, 0x6D, 0x43, 0x41, 0xDD, 0xF9,
+    0x4C, 0xA5, 0xF6, 0x8C, 0x49, 0x2F, 0x31, 0x3B
+  };
+  static const uint8_t offset[8] = {
+    0x00, 0xE0, 0xEF, 0x0F, 0xF1, 0x00, 0x00, 0x00
+  };
+  return static_cast<uint8_t>(base[counter & 0x0F] ^ offset[status & 0x07]);
+}
+
+static uint8_t rightStalkNextCounter() {
+  rightStalkTxCounter = static_cast<uint8_t>((rightStalkTxCounter + 1) & 0x0F);
+  g_status.rightStalkCounter = rightStalkTxCounter;
+  return rightStalkTxCounter;
+}
+
+static can_frame rightStalkFrame(uint8_t status) {
+  can_frame f = {};
+  f.can_id = CANB_ID_SCCM_RIGHT_STALK;
+  f.can_dlc = 3;  // real SCCM_rightStalk is DLC=3 (cap80); DLC=8 was rejected
+  const uint8_t counter = rightStalkNextCounter();
+  f.data[0] = rightStalkCrc229(counter, status);
+  f.data[1] = static_cast<uint8_t>(((status & 0x07) << 4) | counter);
+  return f;
+}
+
+static bool scrollGearSafetyOk(uint8_t targetGear) {
+  const uint32_t now = millis();
+  if (targetGear != GEAR_D && targetGear != GEAR_R) {
+    scrollGearLastBlocked = 1;
+    return false;
+  }
+  if (!g_brakePedalActive || g_brakePedalActiveSinceMs == 0 ||
+      (now - g_brakePedalActiveSinceMs) < SCROLL_GEAR_BRAKE_HOLD_MS) {
+    scrollGearLastBlocked = 2;
+    return false;
+  }
+  if (!g_vehicleSpeedValid || g_vehicleSpeedKph > SCROLL_GEAR_MAX_SPEED_KPH) {
+    scrollGearLastBlocked = 3;
+    return false;
+  }
+  if (g_status.currentGear == targetGear) {
+    scrollGearLastBlocked = 4;
+    return false;
+  }
+  if ((int32_t)(now - scrollGearCooldownUntilMs) < 0) {
+    scrollGearLastBlocked = 5;
+    return false;
+  }
+  scrollGearLastBlocked = 0;
+  return true;
+}
+
+static void requestScrollGearShift(uint8_t targetGear, const RuntimeConfig& cfg) {
+  g_status.scrollGearIntent = (targetGear == GEAR_D) ? 1 : (targetGear == GEAR_R ? -1 : 0);
+  g_status.scrollGearDryRun = cfg.scrollGearSimEnabled ? 1 : 0;
+  g_status.scrollGearInjectBlocked = 0;
+  g_status.scrollGearInjectOk = 0;
+  g_status.scrollGearInjectTarget = targetGear;
+
+  if (!cfg.scrollGearInjectEnabled) return;
+  if (scrollGearShiftActive) return;
+  if (!scrollGearSafetyOk(targetGear)) {
+    g_status.scrollGearInjectBlocked = scrollGearLastBlocked;
+    return;
+  }
+
+  scrollGearShiftActive = true;
+  scrollGearTargetGear = targetGear;
+  scrollGearPhaseIndex = 0;
+  scrollGearIdleFramesRemaining = 0;
+  scrollGearNextTxMs = 0;
+  g_status.scrollGearInjectActive = 1;
+}
+
+static void serviceScrollGearShift(const RuntimeConfig& cfg) {
+  if (!scrollGearShiftActive) {
+    g_status.scrollGearInjectActive = 0;
+    return;
+  }
+  if (!canbReady || !cfg.canbEnabled || !cfg.scrollGearInjectEnabled ||
+      !scrollGearSafetyOk(scrollGearTargetGear)) {
+    canb_send(rightStalkFrame(RIGHT_STALK_IDLE));
+    scrollGearShiftActive = false;
+    scrollGearCooldownUntilMs = millis() + SCROLL_GEAR_COOLDOWN_MS;
+    g_status.scrollGearInjectActive = 0;
+    g_status.scrollGearInjectBlocked = scrollGearLastBlocked;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (scrollGearNextTxMs != 0 && (int32_t)(now - scrollGearNextTxMs) < 0) return;
+
+  uint8_t status = RIGHT_STALK_IDLE;
+  if (scrollGearPhaseIndex < SCROLL_GEAR_STATUS_FRAMES) {
+    if (scrollGearTargetGear == GEAR_R) {
+      status = (scrollGearPhaseIndex == 0) ? RIGHT_STALK_R_STAGE1 : RIGHT_STALK_R_STAGE2;
+    } else {
+      status = (scrollGearPhaseIndex == 0) ? RIGHT_STALK_D_STAGE1 : RIGHT_STALK_D_STAGE2;
+    }
+    scrollGearPhaseIndex++;
+  } else if (scrollGearIdleFramesRemaining < SCROLL_GEAR_IDLE_FRAMES) {
+    status = RIGHT_STALK_IDLE;
+    scrollGearIdleFramesRemaining++;
+  } else {
+    scrollGearShiftActive = false;
+    scrollGearCooldownUntilMs = now + SCROLL_GEAR_COOLDOWN_MS;
+    g_status.scrollGearInjectActive = 0;
+    g_status.scrollGearInjectOk = (g_status.currentGear == scrollGearTargetGear) ? 1 : 0;
+    return;
+  }
+
+  canb_send(rightStalkFrame(status));
+  scrollGearNextTxMs = now + SCROLL_GEAR_FRAME_INTERVAL_MS;
+}
+
+// Hazard via VCLEFT_switchStatus (0x3C2): reuse the latest live frame and only
+// set/clear byte0 bit3 (hazardButtonPressed), leaving the counter/CRC bytes as
+// the car last sent them. Capture: press = 08 55 55 55 00 00 59 45.
+// NOTE: hazard is a momentary BUTTON (toggles hazards); pulse behaviour still
+// needs on-vehicle validation.
+static can_frame vcleftHazardFrame(bool pressed) {
+  can_frame f = {};
+  if (canbHasLastVcleftMux0Frame) {
+    f = canbLastVcleftMux0Frame;  // reuse a real mux0 frame (its counter/CRC bytes)
+  } else {
+    // Captured mux0 idle VCLEFT_switchStatus (hazard released).
+    static const uint8_t baseData[8] = {0x00, 0x55, 0x55, 0x55, 0x00, 0x00, 0x59, 0x45};
+    f.can_dlc = 8;
+    memcpy(f.data, baseData, sizeof(f.data));
+  }
+  f.can_id = CANB_ID_VCLEFT_SWITCH;
+  if (f.can_dlc < 4) f.can_dlc = 4;
+  f.data[0] = static_cast<uint8_t>(f.data[0] & static_cast<uint8_t>(~VCLEFT_MUX_MASK));  // force mux0
+  f.data[0] = pressed
+    ? static_cast<uint8_t>(f.data[0] | VCLEFT_HAZARD_BUTTON_MASK)
+    : static_cast<uint8_t>(f.data[0] & static_cast<uint8_t>(~VCLEFT_HAZARD_BUTTON_MASK));
+  return f;
+}
+
+static uint8_t teslaCanChecksum(uint16_t canId, const uint8_t* data, uint8_t len) {
+  uint8_t checksum = static_cast<uint8_t>((canId & 0xFF) + ((canId >> 8) & 0xFF));
+  for (uint8_t i = 0; i + 1 < len; ++i) checksum += data[i];
+  return checksum;
+}
+
+static can_frame rearFogFrame(bool fogOn) {
+  can_frame f = {};
+  static const uint8_t baseData[8] = {0x81, 0xE1, 0x10, 0x40, 0x0B, 0x03, 0x30, 0x12};
+  if (canbHasLastBodyLightingFrame) {
+    f = canbLastBodyLightingFrame;
+  } else {
+    f.can_id = CANB_ID_BODY_LIGHTING;
+    f.can_dlc = 8;
+    memcpy(f.data, baseData, sizeof(f.data));
+  }
+  f.can_id = CANB_ID_BODY_LIGHTING;
+  if (f.can_dlc < 8) f.can_dlc = 8;
+  f.data[2] = fogOn
+    ? static_cast<uint8_t>(f.data[2] | REAR_FOG_MASK)
+    : static_cast<uint8_t>(f.data[2] & ~REAR_FOG_MASK);
+  return f;
+}
+
+static void stopHighBeamStrobe(bool sendIdle) {
+  if (sendIdle && canbReady) {
+    canb_send(highBeamFrame(STALK_STATUS_IDLE));
+  }
+  highBeamStrobeActive = false;
+  highBeamStrobeManualTrigger = false;
+  highBeamStrobeOutputOn = false;
+  highBeamStrobePulsesRemaining = 0;
+  highBeamStrobeLastToggleMs = 0;
+  highBeamStrobeLastSendMs = 0;
+  g_status.highBeamStrobeActive = 0;
+  g_status.highBeamStrobeRemaining = 0;
+}
+
+static void startHighBeamStrobe(bool manualTrigger = false) {
+  highBeamStrobeActive = true;
+  highBeamStrobeManualTrigger = manualTrigger;
+  highBeamStrobeOutputOn = false;
+  highBeamStrobePulsesRemaining = HIGH_BEAM_STROBE_PULSES;
+  highBeamStrobeLastToggleMs = 0;
+  highBeamStrobeLastSendMs = 0;
+  g_status.highBeamStrobeActive = 1;
+  g_status.highBeamStrobeRemaining = HIGH_BEAM_STROBE_PULSES;
+}
+
+static void stopRearFogBrakeStrobe(bool sendOff) {
+  if (sendOff && canbReady) {
+    canb_send(rearFogFrame(false));
+  }
+  rearFogBrakeStrobeActive = false;
+  rearFogBrakeStrobeManualTrigger = false;
+  rearFogBrakeStrobeOutputOn = false;
+  rearFogBrakeStrobePulsesRemaining = 0;
+  rearFogBrakeStrobePriority = 0;
+  rearFogBrakeStrobeLastToggleMs = 0;
+  g_status.rearFogBrakeStrobeActive = 0;
+  g_status.rearFogBrakeStrobeRemaining = 0;
+}
+
+static void startRearFogBrakeStrobe(uint8_t pulses, uint8_t priority, bool manualTrigger = false) {
+  if (rearFogBrakeStrobeActive && priority < rearFogBrakeStrobePriority) return;
+  rearFogBrakeStrobeActive = true;
+  rearFogBrakeStrobeManualTrigger = manualTrigger;
+  rearFogBrakeStrobeOutputOn = false;
+  rearFogBrakeStrobePulsesRemaining = pulses;
+  rearFogBrakeStrobePriority = priority;
+  rearFogBrakeStrobeLastToggleMs = 0;
+  g_status.rearFogBrakeStrobeActive = 1;
+  g_status.rearFogBrakeStrobeRemaining = pulses;
+}
+
+static void stopReverseStrobe(bool sendOff) {
+  if (sendOff && canbReady) {
+    canb_send(vcleftHazardFrame(false));  // release any in-progress hazard button press
+    if (reverseHazardLatchedOn) {
+      canb_send(vcleftHazardFrame(true));   // toggle hazards back off if this feature turned them on
+      canb_send(vcleftHazardFrame(false));  // release the OFF click
+    }
+    canb_send(rearFogFrame(false));
+  }
+  reverseStrobeActive = false;
+  reverseStrobePhase = 0;
+  reverseStrobePhaseEnd = 0;
+  reverseHazardLatchedOn = false;
+  g_status.reverseStrobeActive = 0;
+  g_status.reverseStrobeRemaining = 0;
+}
+
+static void startReverseStrobe() {
+  if (!canbReady) return;
+  if (reverseStrobePhase != 0 || reverseStrobeActive) return;
+  reverseStrobeActive = true;
+  reverseStrobePhase = 1;                                 // ON-press
+  reverseStrobePhaseEnd = millis() + REVERSE_HAZARD_CLICK_MS;
+  canb_send(vcleftHazardFrame(true));                     // single press edge -> hazards ON
+  reverseHazardLatchedOn = true;
+  g_status.reverseStrobeActive = 1;
+  g_status.reverseStrobeRemaining = 1;
+  startRearFogBrakeStrobe(REVERSE_STROBE_PULSES, REAR_FOG_PRIORITY_REVERSE, true);
+}
+
+static bool readBitsLE(const can_frame& frame, uint8_t startBit, uint8_t length, uint32_t& value) {
+  if (length == 0 || length > 32) return false;
+  if (static_cast<uint16_t>(startBit) + length > static_cast<uint16_t>(frame.can_dlc) * 8U) return false;
+  uint32_t raw = 0;
+  for (uint8_t i = 0; i < length; ++i) {
+    const uint8_t bit = static_cast<uint8_t>(startBit + i);
+    if ((frame.data[bit / 8] >> (bit % 8)) & 0x01) {
+      raw |= (1UL << i);
+    }
+  }
+  value = raw;
+  return true;
+}
+
+static bool readSignedBitsLE(const can_frame& frame, uint8_t startBit, uint8_t length, int32_t& value) {
+  uint32_t raw = 0;
+  if (!readBitsLE(frame, startBit, length, raw)) return false;
+  if (length < 32 && (raw & (1UL << (length - 1)))) {
+    raw |= (~0UL << length);
+  }
+  value = static_cast<int32_t>(raw);
+  return true;
+}
+
+static bool lockSleepVcsecStatusLocked(uint8_t status) {
+  return status == 2 || status == 5 || status == 8 ||
+         status == 10 || status == 12 || status == 15;
+}
+
+static bool isVehicleLockSignal(const can_frame& frame, uint8_t& source) {
+  uint32_t raw = 0;
+  if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 3) {
+    if (!readBitsLE(frame, 17, 3, raw)) return false;
+    const uint8_t lockRequest = static_cast<uint8_t>(raw);
+    if (lockRequest == 1 || lockRequest == 4) {
+      source = 1;
+      return true;
+    }
+  } else if (frame.can_id == CANB_ID_VCSEC_STATUS && frame.can_dlc >= 8) {
+    uint32_t vehicleLockStatus = 0;
+    uint32_t simpleLockStatus = 0;
+    if (!readBitsLE(frame, 12, 4, vehicleLockStatus)) return false;
+    if (!readBitsLE(frame, 54, 2, simpleLockStatus)) return false;
+    if (simpleLockStatus == 2 || lockSleepVcsecStatusLocked(static_cast<uint8_t>(vehicleLockStatus))) {
+      source = 2;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void requestLockDeepSleep(const can_frame& frame, uint8_t source) {
+  if (!g_config.lockDeepSleepEnabled || lockDeepSleepPending) return;
+  canTxInhibitedForSleep = true;
+  lockDeepSleepPending = true;
+  lockDeepSleepPendingMs = millis();
+  lockSleepLastSignalMs = lockDeepSleepPendingMs;
+  g_status.lockSleepTriggered = 1;
+  g_status.lockSleepLastId = frame.can_id;
+  g_status.lockSleepSource = source;
+}
+
+static void serviceLockDeepSleep() {
+  if (!lockDeepSleepPending) return;
+  const uint32_t now = millis();
+  if (now - lockDeepSleepPendingMs < 50) return;
+
+  canTxInhibitedForSleep = true;
+  g_status.highBeamStrobeActive = 0;
+  g_status.highBeamStrobeRemaining = 0;
+  g_status.rearFogBrakeStrobeActive = 0;
+  g_status.rearFogBrakeStrobeRemaining = 0;
+  g_status.reverseStrobeActive = 0;
+  g_status.reverseStrobeRemaining = 0;
+  g_status.batteryPreheatActive = 0;
+  g_status.scrollGearInjectActive = 0;
+
+#ifdef ENABLE_LIGHT_WEBUI
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+#endif
+
+  twai_stop();
+  twai_driver_uninstall();
+  digitalWrite(PIN_LED, HIGH);
+  delay(20);
+  esp_deep_sleep_start();
+}
+
+static void handleBatteryTempDiagFrame(const can_frame& frame, uint8_t bus) {
+  if (frame.can_id != CAN_ID_BMS_THERMAL_STATUS &&
+      frame.can_id != CAN_ID_BMS_PACK_TEMPERATURES &&
+      frame.can_id != CAN_ID_BMS_LOG1) {
+    return;
+  }
+  bmsTempLastRxMs = millis();
+  g_status.bmsTempFrameSeen = 1;
+  g_status.bmsTempFrameId = frame.can_id;
+  g_status.bmsTempFrameBus = bus;
+  g_status.bmsTempFrameMux = frame.can_dlc > 0 ? static_cast<uint8_t>(frame.data[0] & 0x0F) : 0;
+  formatPayload8(frame, g_status.bmsTempFramePayload);
+}
+
+static void handleRearFogDecelAccel(float accel, const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+  if (!canbReady || !cfg.canbEnabled || !cfg.rearFogBrakeStrobeEnabled) {
+    rearFogMildDecelStartMs = 0;
+    rearFogHardDecelStartMs = 0;
+    rearFogMildDecelTriggered = false;
+    rearFogHardDecelTriggered = false;
+    return;
+  }
+
+  const bool recentPedalBrake = now < rearFogRecentPedalBrakeUntilMs;
+  const bool recentBrakeLamp = now < rearFogRecentBrakeLampUntilMs;
+  const bool recentBrakeTorque = now < rearFogRecentBrakeTorqueUntilMs;
+  const bool recentRegen = now < rearFogRecentRegenUntilMs;
+  const bool recentNegTorque = now < rearFogRecentNegTorqueUntilMs;
+  const bool recentSpeedFalling = now < rearFogRecentSpeedFallingUntilMs;
+
+  const bool hardAux = recentBrakeLamp || recentBrakeTorque || recentPedalBrake;
+  const bool mildAux = hardAux || recentRegen || recentNegTorque || recentSpeedFalling;
+  const bool hardCandidate =
+    (accel <= REAR_FOG_HARD_DECEL_THRESHOLD && hardAux) ||
+    (accel <= REAR_FOG_VERY_HARD_DECEL_THRESHOLD);
+  const bool mildCandidate =
+    !hardCandidate && accel <= REAR_FOG_MILD_DECEL_THRESHOLD && mildAux;
+
+  if (!hardCandidate) {
+    rearFogHardDecelStartMs = 0;
+    rearFogHardDecelTriggered = false;
+  } else {
+    if (rearFogHardDecelStartMs == 0) rearFogHardDecelStartMs = now;
+    if (!rearFogHardDecelTriggered &&
+        (now - rearFogHardDecelStartMs) >= REAR_FOG_HARD_DECEL_HOLD_MS) {
+      startRearFogBrakeStrobe(REAR_FOG_BODY_STROBE_PULSES, REAR_FOG_PRIORITY_BODY);
+      rearFogHardDecelTriggered = true;
+      rearFogMildDecelTriggered = true;
+    }
+  }
+
+  if (!mildCandidate || hardCandidate) {
+    rearFogMildDecelStartMs = 0;
+    if (!mildCandidate) rearFogMildDecelTriggered = false;
+    return;
+  }
+
+  if (rearFogMildDecelStartMs == 0) rearFogMildDecelStartMs = now;
+  if (!rearFogMildDecelTriggered &&
+      (now - rearFogMildDecelStartMs) >= REAR_FOG_MILD_DECEL_HOLD_MS) {
+    startRearFogBrakeStrobe(REAR_FOG_PEDAL_STROBE_PULSES, REAR_FOG_PRIORITY_PEDAL);
+    rearFogMildDecelTriggered = true;
+  }
+}
+
+static void serviceHighBeamStrobe(const RuntimeConfig& cfg) {
+  if (!canbReady) return;
+  // 0x249 high-light strobe: alternate PULL(status=1) and idle(status=0).
+  if (!cfg.canbEnabled) {
+    if (highBeamStrobeActive || highBeamStrobeOutputOn) stopHighBeamStrobe(false);
+    return;
+  }
+
+  if (!cfg.highBeamStrobeEnabled && !highBeamStrobeManualTrigger) {
+    if (highBeamStrobeActive || highBeamStrobeOutputOn) stopHighBeamStrobe(true);
+    highBeamPullCount = 0;
+    highBeamLastPullDown = false;
+    return;
+  }
+
+  if (!highBeamStrobeActive) return;
+
+  const uint32_t now = millis();
+  if (highBeamStrobeLastToggleMs != 0 &&
+      (now - highBeamStrobeLastToggleMs) < HIGH_BEAM_STROBE_INTERVAL_MS) {
+    if (highBeamStrobeLastSendMs == 0 ||
+        (now - highBeamStrobeLastSendMs) >= HIGH_BEAM_STROBE_RESEND_MS) {
+      canb_send(highBeamFrame(highBeamStrobeOutputOn ? STALK_STATUS_PULL : STALK_STATUS_IDLE));
+      highBeamStrobeLastSendMs = now;
+    }
+    g_status.highBeamStrobeActive = 1;
+    g_status.highBeamStrobeRemaining = highBeamStrobePulsesRemaining;
+    return;
+  }
+  highBeamStrobeLastToggleMs = now;
+
+  if (!highBeamStrobeOutputOn) {
+    canb_send(highBeamFrame(STALK_STATUS_PULL));
+    highBeamStrobeOutputOn = true;
+  } else {
+    canb_send(highBeamFrame(STALK_STATUS_IDLE));
+    highBeamStrobeOutputOn = false;
+    if (highBeamStrobePulsesRemaining > 0) highBeamStrobePulsesRemaining--;
+    if (highBeamStrobePulsesRemaining == 0) {
+      stopHighBeamStrobe(false);
+      return;
+    }
+  }
+  highBeamStrobeLastSendMs = now;
+
+  g_status.highBeamStrobeActive = 1;
+  g_status.highBeamStrobeRemaining = highBeamStrobePulsesRemaining;
+}
+
+static void serviceReverseStrobe(const RuntimeConfig& cfg) {
+  if (!canbReady) return;
+  if (!cfg.canbEnabled) {
+    if (reverseStrobePhase != 0) stopReverseStrobe(false);
+    return;
+  }
+  if (!cfg.reverseStrobeEnabled) {
+    if (reverseStrobePhase != 0) stopReverseStrobe(true);
+    lastDIGearRaw = 0;
+    return;
+  }
+  if (reverseStrobePhase == 0) return;
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - reverseStrobePhaseEnd) < 0) {
+    g_status.reverseStrobeActive = 1;
+    return;  // current phase still running
+  }
+
+  switch (reverseStrobePhase) {
+    case 1:  // ON-press done -> release button; hold while the car flashes
+      canb_send(vcleftHazardFrame(false));
+      reverseStrobePhase = 2;
+      reverseStrobePhaseEnd = now + REVERSE_HAZARD_ON_MS;
+      break;
+    case 2:  // hold done -> press again to toggle hazards back off
+      canb_send(vcleftHazardFrame(true));
+      reverseHazardLatchedOn = false;
+      reverseStrobePhase = 3;
+      reverseStrobePhaseEnd = now + REVERSE_HAZARD_CLICK_MS;
+      break;
+    default:  // case 3: OFF-press done -> release and finish
+      stopReverseStrobe(true);
+      return;
+  }
+  g_status.reverseStrobeActive = 1;
+}
+
+static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg) {
+  if (!canbReady) return;
+  // 0x273 鍚庨浘鐏垎闂細韪╁埞杞﹀彧璐熻矗瑙﹀彂锛屽疄闄呰緭鍑哄浐瀹?6 涓?ON/OFF 鑴夊啿銆?  if (!canbReady) return;
+  if (!cfg.canbEnabled) {
+    if (rearFogBrakeStrobeActive || rearFogBrakeStrobeOutputOn) stopRearFogBrakeStrobe(false);
+    return;
+  }
+
+  if (!cfg.rearFogBrakeStrobeEnabled && !rearFogBrakeStrobeManualTrigger) {
+    if (rearFogBrakeStrobeActive || rearFogBrakeStrobeOutputOn) stopRearFogBrakeStrobe(true);
+    rearFogLastPedalBrakeActive = false;
+    rearFogLastBrakeActive = false;
+    return;
+  }
+
+  if (!rearFogBrakeStrobeActive) return;
+
+  const uint32_t now = millis();
+  if (rearFogBrakeStrobeLastToggleMs != 0 &&
+      (now - rearFogBrakeStrobeLastToggleMs) < REAR_FOG_STROBE_INTERVAL_MS) {
+    g_status.rearFogBrakeStrobeActive = 1;
+    g_status.rearFogBrakeStrobeRemaining = rearFogBrakeStrobePulsesRemaining;
+    return;
+  }
+  rearFogBrakeStrobeLastToggleMs = now;
+
+  if (!rearFogBrakeStrobeOutputOn) {
+    canb_send(rearFogFrame(true));
+    rearFogBrakeStrobeOutputOn = true;
+  } else {
+    canb_send(rearFogFrame(false));
+    rearFogBrakeStrobeOutputOn = false;
+    if (rearFogBrakeStrobePulsesRemaining > 0) rearFogBrakeStrobePulsesRemaining--;
+    if (rearFogBrakeStrobePulsesRemaining == 0) {
+      stopRearFogBrakeStrobe(false);
+      return;
+    }
+  }
+
+  g_status.rearFogBrakeStrobeActive = 1;
+  g_status.rearFogBrakeStrobeRemaining = rearFogBrakeStrobePulsesRemaining;
+}
+
+static void handleRearFogPedalBrakeEdge(bool brakeActive, const RuntimeConfig& cfg) {
+  (void)cfg;
+  const uint32_t now = millis();
+  if (brakeActive) {
+    rearFogRecentPedalBrakeUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+  }
+  rearFogLastPedalBrakeActive = brakeActive;
+}
+
+static void handleRearFogBrakeLampState(bool brakeActive, const RuntimeConfig& cfg) {
+  (void)cfg;
+  const uint32_t now = millis();
+  if (brakeActive) {
+    rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+  }
+  rearFogLastBrakeActive = brakeActive;
+}
+
+static void handleRearFogCanADecelFrame(const can_frame& frame, const RuntimeConfig& cfg) {
+  const uint32_t now = millis();
+
+  if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
+    handleVcleftSwitchFrame(frame, cfg, false);
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_BRAKE_PEDAL && frame.can_dlc >= 8) {
+    uint32_t raw = 0;
+    const bool brakeLamp = readBitsLE(frame, 21, 1, raw) && raw != 0;
+    const bool driverBrake =
+      readBitsLE(frame, 29, 2, raw) && raw == 2;
+    const bool brakeApply =
+      readBitsLE(frame, 31, 1, raw) && raw != 0;
+    const bool brakeTorque =
+      readBitsLE(frame, 51, 13, raw) && raw > 0;
+    setBrakePedalActive(driverBrake || brakeApply);  // shared with 0x3C2 scroll-gear trigger
+    handleRearFogPedalBrakeEdge(driverBrake || brakeApply, cfg);
+    if (brakeLamp) rearFogRecentBrakeLampUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    if (brakeTorque) rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    return;
+  }
+
+  if ((frame.can_id == CAN_ID_RCM_INERTIAL2_CH || frame.can_id == CAN_ID_RCM_INERTIAL2_ETH) &&
+      frame.can_dlc >= 6) {
+    int32_t rawAccel = 0;
+    if (readSignedBitsLE(frame, 0, 16, rawAccel) && rawAccel != -32768) {
+      bool qfOk = true;
+      uint32_t qf = 1;
+      if (frame.can_id == CAN_ID_RCM_INERTIAL2_CH && frame.can_dlc >= 7) {
+        qfOk = readBitsLE(frame, 48, 1, qf) && qf != 0;
+      }
+      if (qfOk) {
+        handleRearFogDecelAccel(static_cast<float>(rawAccel) * 0.00125f, cfg);
+      }
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DI_SYSTEM_STATUS && frame.can_dlc >= 8) {
+    const uint8_t gearRaw = static_cast<uint8_t>((frame.data[2] >> 5) & 0x07);
+    g_status.currentGear = gearRaw;
+    uint32_t brakeRaw = 0;
+    if (readBitsLE(frame, 19, 2, brakeRaw)) setBrakePedalActive(brakeRaw == 2);
+    if (cfg.reverseStrobeEnabled && gearRaw == 2 && lastDIGearRaw != 2) {
+      startReverseStrobe();
+    }
+    lastDIGearRaw = gearRaw;
+
+    uint32_t raw = 0;
+    if (readBitsLE(frame, 51, 1, raw) && raw != 0) {
+      rearFogRecentRegenUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    int32_t accelRaw = 0;
+    if (readSignedBitsLE(frame, 52, 12, accelRaw) && accelRaw != -2048) {
+      handleRearFogDecelAccel(static_cast<float>(accelRaw) * 0.01f, cfg);
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DI_CHASSIS_CONTROL && frame.can_dlc >= 4) {
+    uint32_t raw = 0;
+    if (readBitsLE(frame, 15, 1, raw) && raw != 0) {
+      rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_ESP_BRAKE_TORQUE && frame.can_dlc >= 7) {
+    uint32_t qf = 0;
+    uint32_t frL = 0, frR = 0, reL = 0, reR = 0;
+    if (readBitsLE(frame, 50, 1, qf) && qf != 0 &&
+        readBitsLE(frame, 0, 12, frL) &&
+        readBitsLE(frame, 12, 12, frR) &&
+        readBitsLE(frame, 24, 12, reL) &&
+        readBitsLE(frame, 36, 12, reR) &&
+        (frL + frR + reL + reR) > 0) {
+      rearFogRecentBrakeTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_DIF_TORQUE && frame.can_dlc >= 8) {
+    int32_t torqueActualRaw = 0;
+    uint32_t qf = 0;
+    if (readSignedBitsLE(frame, 27, 13, torqueActualRaw) &&
+        readBitsLE(frame, 56, 2, qf) && qf == 1 &&
+        torqueActualRaw < 0) {
+      rearFogRecentNegTorqueUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    return;
+  }
+
+  if (frame.can_id == CAN_ID_VEHICLE_SPEED && frame.can_dlc >= 4) {
+    const uint16_t rawSpeed =
+      static_cast<uint16_t>((static_cast<uint16_t>(frame.data[2]) << 4) | (frame.data[1] >> 4));
+    float speedKph = static_cast<float>(rawSpeed) * 0.08f - 40.0f;
+    if (speedKph < 0.0f) speedKph = 0.0f;
+    g_vehicleSpeedKph = speedKph;
+    g_vehicleSpeedValid = true;
+    g_status.vehicleSpeedKph = static_cast<int>(speedKph + 0.5f);
+    if (rearFogLastVehicleSpeedKph >= 0.0f &&
+        speedKph + 0.5f < rearFogLastVehicleSpeedKph) {
+      rearFogRecentSpeedFallingUntilMs = now + REAR_FOG_DECEL_RECENT_MS;
+    }
+    rearFogLastVehicleSpeedKph = speedKph;
+    return;
+  }
+}
+
+static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig& cfg, bool cacheHazardFrame) {
+  if (frame.can_dlc < 4) return;
+  if (cacheHazardFrame) {
+    canbLastVcleftSwitchFrame = frame;
+    canbHasLastVcleftSwitchFrame = true;
+  }
+
+  const uint8_t mux = static_cast<uint8_t>(frame.data[0] & VCLEFT_MUX_MASK);
+  if (cacheHazardFrame && mux == VCLEFT_MUX_HAZARD) {
+    canbLastVcleftMux0Frame = frame;
+    canbHasLastVcleftMux0Frame = true;
+  }
+
+  if (mux != VCLEFT_MUX_SCROLL) return;
+
+  const uint8_t scrollRaw = static_cast<uint8_t>(frame.data[3] & 0x3F);
+  const int8_t scrollTicks = (scrollRaw & 0x20)
+    ? static_cast<int8_t>(static_cast<int>(scrollRaw) - 64)
+    : static_cast<int8_t>(scrollRaw);
+  g_status.rightScrollTicks = scrollTicks;
+
+  const bool scrollEdge = (scrollTicks != 0) && !scrollGearLatched;
+  if (scrollTicks == 0) {
+    scrollGearLatched = false;
+  } else if (scrollEdge && g_brakePedalActive) {
+    const uint8_t targetGear = (scrollTicks < 0) ? GEAR_R : GEAR_D;
+    const bool sameGearRequest = (g_status.currentGear == targetGear);
+    if (sameGearRequest) {
+      scrollGearLastBlocked = 4;
+      g_status.scrollGearIntent = 0;
+      g_status.scrollGearInjectBlocked = scrollGearLastBlocked;
+      g_status.scrollGearInjectTarget = targetGear;
+    } else {
+      requestScrollGearShift(targetGear, cfg);
+    }
+  }
+
+  if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollEdge) {
+    const uint8_t targetGear = (scrollTicks < 0) ? GEAR_R : GEAR_D;
+    const bool sameGearRequest = (g_status.currentGear == targetGear);
+    if (scrollTicks < 0 && !sameGearRequest) {
+      if (!reverseStrobeActive) startReverseStrobe();
+    } else if (scrollTicks > 0 && reverseStrobeActive) {
+      stopReverseStrobe(true);
+    }
+  }
+  if (scrollTicks != 0) scrollGearLatched = true;
+}
+
+static void handleCanBFrame(const can_frame& frame) {
+  // Stage 1: statistics only. No heavy work, no Serial, no JSON, no bridging.
+  canbLastId = frame.can_id;
+  uint8_t lockSource = 0;
+  if (isVehicleLockSignal(frame, lockSource)) {
+    lockSleepLastSignalMs = millis();
+    g_status.lockSleepLastId = frame.can_id;
+    g_status.lockSleepSource = lockSource;
+    requestLockDeepSleep(frame, lockSource);
+    if (lockDeepSleepPending) return;
+  }
+
+  if (frame.can_id == CANB_ID_STW_ACTN_RQ && frame.can_dlc >= 2) {
+    canbLastStwActnRqFrame = frame;
+    canbHasLastStwActnRqFrame = true;
+    highBeamStalkLastCounter = static_cast<uint8_t>(frame.data[1] & 0x0F);
+
+    const RuntimeConfig cfg = configSnapshot();
+    const uint8_t stalkStatus = readStalkStatus(frame);
+    const bool pullDown = stalkStatus == STALK_STATUS_PULL;
+    const uint32_t now = millis();
+
+    if (!cfg.highBeamStrobeEnabled) {
+      highBeamPullCount = 0;
+    } else if (pullDown && !highBeamLastPullDown && !highBeamStrobeActive) {
+      if (highBeamLastPullMs == 0 ||
+          (now - highBeamLastPullMs) > HIGH_BEAM_DOUBLE_PULL_WINDOW_MS) {
+        highBeamPullCount = 0;
+      }
+      highBeamLastPullMs = now;
+      highBeamPullCount++;
+      if (highBeamPullCount >= 2) {
+        highBeamPullCount = 0;
+        startHighBeamStrobe();
+      }
+    }
+    highBeamLastPullDown = pullDown;
+  }
+
+  if (frame.can_id == CANB_ID_SCCM_RIGHT_STALK && frame.can_dlc >= 2) {
+    canbLastRightStalkFrame = frame;
+    canbHasLastRightStalkFrame = true;
+    const uint8_t status = static_cast<uint8_t>((frame.data[1] >> 4) & 0x07);
+    const uint8_t counter = static_cast<uint8_t>(frame.data[1] & 0x0F);
+    g_status.rightStalkStatus = status;
+    g_status.rightStalkCounter = counter;
+    // Only re-align our TX counter to the live SCCM counter when we are NOT
+    // injecting. During an active scroll-gear burst the counter must free-run
+    // strictly +1 (like the real stalk); re-syncing here would let incoming
+    // idle frames yank it back and produce duplicate counters in our own TX,
+    // which the gear receiver rejects.
+    if (!scrollGearShiftActive) rightStalkTxCounter = counter;
+  }
+
+  if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 8) {
+    canbLastBodyLightingFrame = frame;
+    // 0x273 璺緞锛氬彧鐢?data[7] bit0 鐨勫埞杞︿笂鍗囨部瑙﹀彂锛屼笉鍦ㄨ繖閲岀洿鎺ュ彂閫併€?    canbLastBodyLightingFrame = frame;
+    canbHasLastBodyLightingFrame = true;
+
+    const RuntimeConfig cfg = configSnapshot();
+    const bool brakeActive = (frame.data[7] & 0x01) != 0;
+    handleRearFogBrakeLampState(brakeActive, cfg);
+  }
+
+  if (frame.can_id == CAN_ID_UI_TRIP_PLANNING && frame.can_dlc >= 8) {
+    cacheBatteryPreheatTemplate(frame);
+  }
+
+  handleBatteryTempDiagFrame(frame, 2);
+
+  if (frame.can_id == CANB_ID_VCLEFT_SWITCH && frame.can_dlc >= 4) {
+    handleVcleftSwitchFrame(frame, configSnapshot(), true);
+    return;
+    canbLastVcleftSwitchFrame = frame;
+    canbHasLastVcleftSwitchFrame = true;
+    const uint8_t mux = static_cast<uint8_t>(frame.data[0] & VCLEFT_MUX_MASK);
+
+    // mux0 carries the hazard button + valid counter/CRC bytes; cache it so the
+    // injected hazard frame rides a real recent counter/CRC.
+    if (mux == VCLEFT_MUX_HAZARD) {
+      canbLastVcleftMux0Frame = frame;
+      canbHasLastVcleftMux0Frame = true;
+    }
+
+    // rightScrollTicks lives ONLY in mux1 (data[3], 6-bit signed, idle 0). Other
+    // muxes use data[3] as 0x55 filler — reading it there gave a phantom +21
+    // scroll that cancelled the reverse strobe while braking. Gate on the mux.
+    if (mux == VCLEFT_MUX_SCROLL) {
+      const uint8_t scrollRaw = static_cast<uint8_t>(frame.data[3] & 0x3F);
+      const int8_t scrollTicks = (scrollRaw & 0x20)
+        ? static_cast<int8_t>(static_cast<int>(scrollRaw) - 64)
+        : static_cast<int8_t>(scrollRaw);
+      g_status.rightScrollTicks = scrollTicks;
+
+      // Brake + right-scroll as a gear-intent trigger source. Dry-run is always
+      // status-only; experimental injection sends bus2 0x229 only when the WebUI
+      // injection switch and all safety gates are true.
+      const RuntimeConfig cfg = configSnapshot();
+      const bool scrollEdge = (scrollTicks != 0) && !scrollGearLatched;
+      if (scrollTicks == 0) {
+        scrollGearLatched = false;
+      } else if (scrollEdge && g_brakePedalActive) {
+        const uint8_t targetGear = (scrollTicks < 0) ? GEAR_R : GEAR_D;
+        requestScrollGearShift(targetGear, cfg);
+      }
+
+      if (cfg.reverseStrobeEnabled && g_brakePedalActive && scrollEdge) {
+        if (scrollTicks < 0) {
+          if (!reverseStrobeActive) startReverseStrobe();
+        } else if (reverseStrobeActive) {
+          stopReverseStrobe(true);
+        }
+      }
+      if (scrollTicks != 0) scrollGearLatched = true;
+    }
+  }
+}
+
+static void drainCanBWithBudget() {
+  if (!canbReady) return;
+
+  const bool intAsserted = (digitalRead(MCP2515_INT) == LOW);
+#ifdef ENABLE_LIGHT_WEBUI
+  const bool recorderActive = recActive;
+#else
+  const bool recorderActive = false;
+#endif
+  const uint8_t budget = (intAsserted || recorderActive) ? CANB_RX_SCAN_LIMIT_ACTIVE : CANB_RX_SCAN_LIMIT;
+  const uint32_t startUs = micros();
+  for (uint8_t i = 0; i < budget; ++i) {
+    can_frame frame;
+    if (!canb_recv(frame)) break;
+    handleCanBFrame(frame);
+    if (lockDeepSleepPending) break;
+    if ((micros() - startUs) >= CANB_RX_DRAIN_TIME_US) break;
+  }
+  updateCanBErrorStatus();
+}
+
+// VCSEC_serviceDiagnosticRequest (0x339) on the BODY bus / CAN B.
+//   enter service mode -> 00 00 00 00 00 80 00 00  (byte5 bit7 = 1)
+//   exit  service mode -> 00 00 00 00 00 00 00 00
+// Spec: 4 frames at 10ms spacing. Default OFF; only sent after a toggle.
+static void setCanBServiceMode(bool enabled) {
+  canbServiceModeActive = enabled;
+  canbServiceBurstByte5 = enabled ? 0x80 : 0x00;
+  canbServiceBurstRemaining = 4;
+  canbLastServiceBurstMs = 0;  // fire the first frame on the next tick
+}
+
+static void serviceCanBScheduledTx() {
+  if (canbServiceBurstRemaining == 0 || !canbReady) return;
+
+  const uint32_t now = millis();
+  if (canbLastServiceBurstMs != 0 && (now - canbLastServiceBurstMs) < 10) return;
+  canbLastServiceBurstMs = now;
+
+  can_frame f = {};
+  f.can_id = 0x339;
+  f.can_dlc = 8;
+  f.data[5] = canbServiceBurstByte5;
+  canb_send(f);
+  canbServiceBurstRemaining--;
+}
+
+#endif  // ENABLE_CANB_MCP2515
+
+// ============================================================================
+// Light WebUI 鈥?optional SoftAP parameter page on a dedicated low-prio task
+// ============================================================================
+#ifdef ENABLE_LIGHT_WEBUI
+
+#ifndef WEBUI_AP_SSID
+#define WEBUI_AP_SSID "T2CAN-FSD"
+#endif
+#ifndef WEBUI_AP_PASS
+#define WEBUI_AP_PASS "12345678"
+#endif
+
+static WebServer server(80);
+static volatile bool webUiEnabled = true;
+static volatile bool webUiShutdownPending = false;
+static Preferences prefs;
+
+static void loadConfigFromPrefs();
+static void saveConfigToPrefs();
+static void setupLightWebUi();
+static void webTask(void*);
+
+#include "web_ui_page.h"  // kIndexHtml 鈥?kept out of the .ino prototype scanner
+
+static void handleRoot() {
+  server.send_P(200, "text/html", kIndexHtml);
+}
+
+static void handleStatus() {
+  // Read-only: snapshot the cached config + status, never touch the CAN bus.
+  RuntimeConfig c = configSnapshot();
+  RuntimeStatus s = g_status;
+  const uint32_t now = millis();
+  s.batteryPreheatVehicleAgeMs = batteryPreheatLastRxMs == 0 ? 0 : (now - batteryPreheatLastRxMs);
+  s.bmsTempFrameAgeMs = bmsTempLastRxMs == 0 ? 0 : (now - bmsTempLastRxMs);
+  s.lockSleepArmed = c.lockDeepSleepEnabled ? 1 : 0;
+  s.lockSleepAgeMs = lockSleepLastSignalMs == 0 ? 0 : (now - lockSleepLastSignalMs);
+
+  String j;
+  j.reserve(2400);
+  j += '{';
+  j += "\"fsdEnabled\":";            j += c.fsdEnabled ? 1 : 0;
+  j += ",\"autoSpeedOffsetEnabled\":"; j += c.autoSpeedOffsetEnabled ? 1 : 0;
+  j += ",\"slewPctPerSec\":";        j += c.slewPctPerSec;
+  j += ",\"lowSpeedMaxPctRaw\":";    j += c.lowSpeedMaxPctRaw;
+  j += ",\"targetBelow60\":";        j += c.targetBelow60;
+  j += ",\"target60\":";             j += c.target60;
+  j += ",\"target70\":";             j += c.target70;
+  j += ",\"target80\":";             j += c.target80;
+  j += ",\"target90\":";             j += c.target90;
+  j += ",\"target100\":";            j += c.target100;
+  j += ",\"target120\":";            j += c.target120;
+  j += ",\"canbEnabled\":";          j += c.canbEnabled ? 1 : 0;
+  j += ",\"canbServiceModeEnabled\":"; j += c.canbServiceModeEnabled ? 1 : 0;
+  j += ",\"canbFilterMode\":";       j += c.canbFilterMode;
+  j += ",\"canbFilterEnabled\":";    j += c.canbFilterMode != CANB_FILTER_ALL ? 1 : 0;
+#ifdef ENABLE_CANB_MCP2515
+  j += ",\"canbReady\":";            j += canbReady ? 1 : 0;
+  j += ",\"canbHardwareFilterMode\":"; j += canbHardwareFilterMode;
+  j += ",\"canbHardwareFilterEnabled\":"; j += canbHardwareFilterMode != CANB_FILTER_ALL ? 1 : 0;
+#else
+  j += ",\"canbReady\":0";
+  j += ",\"canbHardwareFilterMode\":0";
+  j += ",\"canbHardwareFilterEnabled\":0";
+#endif
+  j += ",\"highBeamStrobeEnabled\":"; j += c.highBeamStrobeEnabled ? 1 : 0;
+  j += ",\"rearFogBrakeStrobeEnabled\":"; j += c.rearFogBrakeStrobeEnabled ? 1 : 0;
+  j += ",\"reverseStrobeEnabled\":"; j += c.reverseStrobeEnabled ? 1 : 0;
+  j += ",\"batteryPreheatEnabled\":"; j += c.batteryPreheatEnabled ? 1 : 0;
+  j += ",\"lockDeepSleepEnabled\":"; j += c.lockDeepSleepEnabled ? 1 : 0;
+  j += ",\"scrollGearSimEnabled\":"; j += c.scrollGearSimEnabled ? 1 : 0;
+  j += ",\"scrollGearInjectEnabled\":"; j += c.scrollGearInjectEnabled ? 1 : 0;
+  j += ",\"can1ReceiveOnly\":"; j += c.can1ReceiveOnly ? 1 : 0;
+  j += ",\"can1Rx\":";               j += s.can1Rx;
+  j += ",\"can1Tx\":";               j += s.can1Tx;
+  j += ",\"can1TxFail\":";           j += s.can1TxFail;
+  j += ",\"twaiBusOffCount\":";      j += s.twaiBusOffCount;
+  j += ",\"twaiState\":";            j += s.twaiState;
+  j += ",\"canbRx\":";               j += s.canbRx;
+  j += ",\"canbTx\":";               j += s.canbTx;
+  j += ",\"canbTxFail\":";           j += s.canbTxFail;
+  j += ",\"canbLastId\":";           j += s.canbLastId;
+  j += ",\"canbErrorFlags\":";       j += s.canbErrorFlags;
+  j += ",\"canbRxOverflowCount\":";  j += s.canbRxOverflowCount;
+  j += ",\"highBeamStrobeActive\":"; j += s.highBeamStrobeActive;
+  j += ",\"highBeamStrobeRemaining\":"; j += s.highBeamStrobeRemaining;
+  j += ",\"rearFogBrakeStrobeActive\":"; j += s.rearFogBrakeStrobeActive;
+  j += ",\"rearFogBrakeStrobeRemaining\":"; j += s.rearFogBrakeStrobeRemaining;
+  j += ",\"reverseStrobeActive\":"; j += s.reverseStrobeActive;
+  j += ",\"reverseStrobeRemaining\":"; j += s.reverseStrobeRemaining;
+  j += ",\"batteryPreheatActive\":"; j += s.batteryPreheatActive;
+  j += ",\"batteryPreheatVehicleSeen\":"; j += s.batteryPreheatVehicleSeen;
+  j += ",\"batteryPreheatTemplateValid\":"; j += s.batteryPreheatTemplateValid;
+  j += ",\"batteryPreheatUiTripActive\":"; j += s.batteryPreheatUiTripActive;
+  j += ",\"batteryPreheatUiNavToSupercharger\":"; j += s.batteryPreheatUiNavToSupercharger;
+  j += ",\"batteryPreheatUiFastChargerType\":"; j += s.batteryPreheatUiFastChargerType;
+  j += ",\"batteryPreheatUiState\":"; j += s.batteryPreheatUiState;
+  j += ",\"batteryPreheatUiRequestHeat\":"; j += s.batteryPreheatUiRequestHeat;
+  j += ",\"batteryPreheatUiPowerW\":"; j += s.batteryPreheatUiPowerW;
+  j += ",\"batteryPreheatUiTargetCx100\":"; j += s.batteryPreheatUiTargetCx100;
+  j += ",\"batteryPreheatUiAmbientCx100\":"; j += s.batteryPreheatUiAmbientCx100;
+  j += ",\"batteryPreheatUiChargeTargetCx10\":"; j += s.batteryPreheatUiChargeTargetCx10;
+  j += ",\"batteryPreheatUiEnergyAtDestination\":"; j += s.batteryPreheatUiEnergyAtDestination;
+  j += ",\"batteryPreheatVehicleAgeMs\":"; j += s.batteryPreheatVehicleAgeMs;
+  j += ",\"bmsTempFrameSeen\":"; j += s.bmsTempFrameSeen;
+  j += ",\"bmsTempFrameId\":"; j += s.bmsTempFrameId;
+  j += ",\"bmsTempFrameBus\":"; j += s.bmsTempFrameBus;
+  j += ",\"bmsTempFrameMux\":"; j += s.bmsTempFrameMux;
+  j += ",\"bmsTempFrameAgeMs\":"; j += s.bmsTempFrameAgeMs;
+  j += ",\"bmsTempFramePayload\":\""; j += s.bmsTempFramePayload; j += '"';
+  j += ",\"lockSleepArmed\":"; j += s.lockSleepArmed;
+  j += ",\"lockSleepTriggered\":"; j += s.lockSleepTriggered;
+  j += ",\"lockSleepLastId\":"; j += s.lockSleepLastId;
+  j += ",\"lockSleepSource\":"; j += s.lockSleepSource;
+  j += ",\"lockSleepAgeMs\":"; j += s.lockSleepAgeMs;
+  j += ",\"rightScrollTicks\":";     j += s.rightScrollTicks;
+  j += ",\"rightStalkStatus\":";     j += s.rightStalkStatus;
+  j += ",\"rightStalkCounter\":";    j += s.rightStalkCounter;
+  j += ",\"currentGear\":";          j += s.currentGear;
+  j += ",\"brakeActive\":";          j += s.brakeActive;
+  j += ",\"scrollGearIntent\":";     j += s.scrollGearIntent;
+  j += ",\"scrollGearDryRun\":";     j += s.scrollGearDryRun;
+  j += ",\"scrollGearInjectActive\":"; j += s.scrollGearInjectActive;
+  j += ",\"scrollGearInjectTarget\":"; j += s.scrollGearInjectTarget;
+  j += ",\"scrollGearInjectOk\":";   j += s.scrollGearInjectOk;
+  j += ",\"scrollGearInjectBlocked\":"; j += s.scrollGearInjectBlocked;
+  j += ",\"vehicleSpeedKph\":";      j += s.vehicleSpeedKph;
+  j += ",\"fusedLimitKph\":";        j += s.fusedLimitKph;
+  j += ",\"targetSpeedKph\":";       j += s.targetSpeedKph;
+  j += ",\"offsetKph\":";            j += s.offsetKph;
+  j += ",\"offsetRaw\":";            j += s.offsetRaw;
+  j += ",\"uptime\":";               j += (uint32_t)(millis() / 1000);
+  j += '}';
+  server.send(200, "application/json", j);
+}
+
+static uint16_t argU16(const char* name, uint16_t fallback) {
+  if (!server.hasArg(name)) return fallback;
+  long v = server.arg(name).toInt();
+  if (v < 0) v = 0;
+  if (v > 65535) v = 65535;
+  return static_cast<uint16_t>(v);
+}
+
+static bool argBool(const char* name, bool fallback) {
+  if (!server.hasArg(name)) return fallback;
+  String v = server.arg(name);
+  return v == "1" || v == "true" || v == "on";
+}
+
+// POST /config 鈥?update the live config in RAM only (no Flash write here).
+static void handleConfig() {
+  RuntimeConfig c = configSnapshot();
+  const uint8_t oldCanBFilterMode = c.canbFilterMode;
+
+  c.fsdEnabled              = argBool("fsdEnabled", c.fsdEnabled);
+  c.autoSpeedOffsetEnabled  = argBool("autoSpeedOffsetEnabled", c.autoSpeedOffsetEnabled);
+  c.slewPctPerSec           = static_cast<uint8_t>(argU16("slewPctPerSec", c.slewPctPerSec));
+  c.lowSpeedMaxPctRaw       = static_cast<uint8_t>(argU16("lowSpeedMaxPctRaw", c.lowSpeedMaxPctRaw));
+  c.targetBelow60           = argU16("targetBelow60", c.targetBelow60);
+  c.target60                = argU16("target60", c.target60);
+  c.target70                = argU16("target70", c.target70);
+  c.target80                = argU16("target80", c.target80);
+  c.target90                = argU16("target90", c.target90);
+  c.target100               = argU16("target100", c.target100);
+  c.target120               = argU16("target120", c.target120);
+  c.canbEnabled             = argBool("canbEnabled", c.canbEnabled);
+  if (server.hasArg("canbFilterMode")) {
+    c.canbFilterMode = static_cast<uint8_t>(argU16("canbFilterMode", c.canbFilterMode));
+    if (c.canbFilterMode > CANB_FILTER_MINIMUM) c.canbFilterMode = CANB_FILTER_ALL;
+  } else {
+    c.canbFilterMode = argBool("canbFilterEnabled", c.canbFilterMode != CANB_FILTER_ALL) ? CANB_FILTER_FEATURE : CANB_FILTER_ALL;
+  }
+  c.highBeamStrobeEnabled   = argBool("highBeamStrobeEnabled", c.highBeamStrobeEnabled);
+  c.rearFogBrakeStrobeEnabled = argBool("rearFogBrakeStrobeEnabled", c.rearFogBrakeStrobeEnabled);
+  c.reverseStrobeEnabled    = argBool("reverseStrobeEnabled", c.reverseStrobeEnabled);
+  c.batteryPreheatEnabled   = argBool("batteryPreheatEnabled", c.batteryPreheatEnabled);
+  c.lockDeepSleepEnabled    = argBool("lockDeepSleepEnabled", c.lockDeepSleepEnabled);
+  c.scrollGearSimEnabled    = argBool("scrollGearSimEnabled", c.scrollGearSimEnabled);
+  c.scrollGearInjectEnabled = argBool("scrollGearInjectEnabled", c.scrollGearInjectEnabled);
+  c.can1ReceiveOnly        = argBool("can1ReceiveOnly", c.can1ReceiveOnly);
+
+  const bool newServiceMode = argBool("canbServiceModeEnabled", c.canbServiceModeEnabled);
+  const bool serviceModeChanged = (newServiceMode != c.canbServiceModeEnabled);
+  c.canbServiceModeEnabled  = newServiceMode;
+  applyBuildModeGuards(c);
+
+  portENTER_CRITICAL(&g_cfgMux);
+  g_config = c;
+  portEXIT_CRITICAL(&g_cfgMux);
+
+#ifdef ENABLE_CANB_MCP2515
+  if (canbReady && c.canbFilterMode != oldCanBFilterMode) {
+    if (!applyCanBFilters(c.canbFilterMode)) {
+      c.canbFilterMode = oldCanBFilterMode;
+      portENTER_CRITICAL(&g_cfgMux);
+      g_config = c;
+      portEXIT_CRITICAL(&g_cfgMux);
+      server.send(500, "application/json", "{\"ok\":false,\"error\":\"canb_filter\"}");
+      return;
+    }
+  }
+
+  // Toggling service mode queues a 0x339 burst (handled non-blocking in loop()).
+  if (serviceModeChanged) setCanBServiceMode(newServiceMode);
+#else
+  (void)serviceModeChanged;
+#endif
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /save 鈥?persist the current RAM config to Flash (Preferences).
+static void handleSave() {
+  saveConfigToPrefs();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /web/off 鈥?acknowledge, then shut the WebUI down asynchronously in the
+// web task so this handler never blocks. CAN is unaffected.
+static void handleWebOff() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  webUiShutdownPending = true;
+}
+
+static void handleCanBTest() {
+#ifdef ENABLE_CANB_MCP2515
+  RuntimeConfig c = configSnapshot();
+  if (!c.canbEnabled) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"canb_disabled\"}");
+    return;
+  }
+  if (!canbReady) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"canb_not_ready\"}");
+    return;
+  }
+  if (!server.hasArg("type")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_type\"}");
+    return;
+  }
+
+  String type = server.arg("type");
+  if (type == "strobe") {
+    startHighBeamStrobe(true);
+  } else if (type == "fog") {
+    startRearFogBrakeStrobe(REAR_FOG_BODY_STROBE_PULSES, REAR_FOG_PRIORITY_BODY, true);
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_type\"}");
+    return;
+  }
+
+  server.send(200, "application/json", "{\"ok\":true}");
+#else
+  server.send(400, "application/json", "{\"ok\":false,\"error\":\"canb_not_compiled\"}");
+#endif
+}
+
+static uint8_t parseRecIdList(const String& s, uint32_t* out, uint8_t maxCount) {
+  uint8_t count = 0;
+  const char* p = s.c_str();
+  while (*p && count < maxCount) {
+    while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+    if (!*p) break;
+    char* end = nullptr;
+    uint32_t v = static_cast<uint32_t>(strtoul(p, &end, 16));
+    if (end == p) break;
+    out[count++] = v & CAN_SFF_MASK;
+    p = end;
+  }
+  return count;
+}
+
+static void handleRecStart() {
+  if (!recBuf || recCapacity == 0) {
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"psram_rec_buffer\"}");
+    return;
+  }
+
+  if (server.hasArg("ids")) {
+    recFilterCount = parseRecIdList(server.arg("ids"), recFilterIds, REC_FILTER_MAX);
+  } else {
+    recFilterCount = 0;
+  }
+  if (server.hasArg("exclude")) {
+    recExcludeCount = parseRecIdList(server.arg("exclude"), recExcludeIds, REC_FILTER_MAX);
+  } else {
+    recExcludeCount = 0;
+  }
+
+  portENTER_CRITICAL(&g_recMux);
+  recCount = 0;
+  recDropped = 0;
+  recBus1Count = 0;
+  recBus2Count = 0;
+  recStopReason = 0;
+  recSaved = false;
+  recStartMs = millis();
+  recActive = true;
+  portEXIT_CRITICAL(&g_recMux);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleRecStop() {
+  portENTER_CRITICAL(&g_recMux);
+  recActive = false;
+  recSaved = true;
+  recStopReason = 0;
+  portEXIT_CRITICAL(&g_recMux);
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handleRecStatus() {
+  if (recActive && (millis() - recStartMs >= REC_MAX_DURATION_MS)) {
+    portENTER_CRITICAL(&g_recMux);
+    recActive = false;
+    recSaved = true;
+    recStopReason = 2;
+    portEXIT_CRITICAL(&g_recMux);
+  }
+  String j;
+  j.reserve(220);
+  j += "{\"active\":";
+  j += recActive ? "true" : "false";
+  j += ",\"count\":";
+  j += recCount;
+  j += ",\"cap\":";
+  j += recCapacity;
+  j += ",\"psram\":";
+  j += recPsramReady ? "true" : "false";
+  j += ",\"bytes\":";
+  j += static_cast<unsigned long>(recBufferBytes);
+  j += ",\"saved\":";
+  j += recSaved ? "true" : "false";
+  j += ",\"dropped\":";
+  j += recDropped;
+  j += ",\"bus1\":";
+  j += recBus1Count;
+  j += ",\"bus2\":";
+  j += recBus2Count;
+  j += ",\"stopReason\":";
+  j += recStopReason;
+  j += ",\"filter\":";
+  j += recFilterCount;
+  j += ",\"exclude\":";
+  j += recExcludeCount;
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+static void handleRecDownload() {
+  if (recActive) {
+    server.send(409, "text/plain", "Stop recording before download");
+    return;
+  }
+  if (!recSaved || recCount == 0) {
+    server.send(404, "text/plain", "No recording saved yet");
+    return;
+  }
+
+  const uint32_t n = recCount;
+  server.sendHeader("Content-Disposition", "attachment; filename=\"can_recording.csv\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  char chunk[1024];
+  size_t used = 0;
+  auto flushChunk = [&]() {
+    if (used == 0) return;
+    server.sendContent(chunk, used);
+    used = 0;
+    yield();
+  };
+  auto appendChunk = [&](const char* text, size_t len) {
+    while (len > 0) {
+      const size_t room = sizeof(chunk) - used;
+      if (room == 0) flushChunk();
+      const size_t take = std::min(len, sizeof(chunk) - used);
+      memcpy(chunk + used, text, take);
+      used += take;
+      text += take;
+      len -= take;
+    }
+  };
+
+  static const char header[] = "ts_ms,dir,bus,controller,physical,id,dlc,b0,b1,b2,b3,b4,b5,b6,b7\n";
+  appendChunk(header, sizeof(header) - 1);
+  char line[128];
+  for (uint32_t i = 0; i < n; ++i) {
+    const RecFrame& r = recBuf[i];
+    const char* controller = (r.bus == 1) ? "TWAI" : ((r.bus == 2) ? "MCP2515" : "unknown");
+    const char* physical = (r.bus == 1) ? "CANB" : ((r.bus == 2) ? "CANA" : "unknown");
+    snprintf(line, sizeof(line),
+             "%lu,%c,%u,%s,%s,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+             static_cast<unsigned long>(r.ts),
+             r.dir ? r.dir : 'R',
+             static_cast<unsigned>(r.bus),
+             controller,
+             physical,
+             static_cast<unsigned long>(r.id),
+             static_cast<unsigned>(r.dlc),
+             static_cast<unsigned>(r.data[0]),
+             static_cast<unsigned>(r.data[1]),
+             static_cast<unsigned>(r.data[2]),
+             static_cast<unsigned>(r.data[3]),
+             static_cast<unsigned>(r.data[4]),
+             static_cast<unsigned>(r.data[5]),
+             static_cast<unsigned>(r.data[6]),
+             static_cast<unsigned>(r.data[7]));
+    appendChunk(line, strlen(line));
+    if ((i & 0x3F) == 0) flushChunk();
+  }
+  flushChunk();
+  server.sendContent("");
+}
+
+static void loadConfigFromPrefs() {
+  prefs.begin("t2can", true);
+  RuntimeConfig c;  // defaults
+  c.fsdEnabled             = prefs.getBool("fsdEnabled", c.fsdEnabled);
+  c.autoSpeedOffsetEnabled = prefs.getBool("autoOffset", c.autoSpeedOffsetEnabled);
+  c.slewPctPerSec          = prefs.getUChar("slewPct", c.slewPctPerSec);
+  c.lowSpeedMaxPctRaw      = prefs.getUChar("lowRaw", c.lowSpeedMaxPctRaw);
+  c.targetBelow60          = prefs.getUShort("tB60", c.targetBelow60);
+  c.target60               = prefs.getUShort("t60", c.target60);
+  c.target70               = prefs.getUShort("t70", c.target70);
+  c.target80               = prefs.getUShort("t80", c.target80);
+  c.target90               = prefs.getUShort("t90", c.target90);
+  c.target100              = prefs.getUShort("t100", c.target100);
+  c.target120              = prefs.getUShort("t120", c.target120);
+  c.canbEnabled            = prefs.getBool("canbEn", c.canbEnabled);
+  c.canbServiceModeEnabled = prefs.getBool("canbSvc", c.canbServiceModeEnabled);
+  c.canbFilterMode         = prefs.getUChar("canbFiltMode",
+                                  prefs.getBool("canbFilt", false) ? CANB_FILTER_FEATURE : c.canbFilterMode);
+  if (c.canbFilterMode > CANB_FILTER_MINIMUM) c.canbFilterMode = CANB_FILTER_ALL;
+  c.highBeamStrobeEnabled  = prefs.getBool("hbStrobe", c.highBeamStrobeEnabled);
+  c.rearFogBrakeStrobeEnabled = prefs.getBool("fogBrake", c.rearFogBrakeStrobeEnabled);
+  c.reverseStrobeEnabled   = prefs.getBool("revStrobe", c.reverseStrobeEnabled);
+  c.batteryPreheatEnabled  = prefs.getBool("batHeat", c.batteryPreheatEnabled);
+  c.lockDeepSleepEnabled   = prefs.getBool("lockSleep", c.lockDeepSleepEnabled);
+  c.scrollGearSimEnabled   = prefs.getBool("gearSim", c.scrollGearSimEnabled);
+  c.scrollGearInjectEnabled = prefs.getBool("gearInject", c.scrollGearInjectEnabled);
+  c.can1ReceiveOnly        = prefs.getBool("can1RxOnly", c.can1ReceiveOnly);
+  prefs.end();
+  applyBuildModeGuards(c);
+
+  portENTER_CRITICAL(&g_cfgMux);
+  g_config = c;
+  portEXIT_CRITICAL(&g_cfgMux);
+}
+
+static void saveConfigToPrefs() {
+  RuntimeConfig c = configSnapshot();
+  prefs.begin("t2can", false);
+  prefs.putBool("fsdEnabled", c.fsdEnabled);
+  prefs.putBool("autoOffset", c.autoSpeedOffsetEnabled);
+  prefs.putUChar("slewPct", c.slewPctPerSec);
+  prefs.putUChar("lowRaw", c.lowSpeedMaxPctRaw);
+  prefs.putUShort("tB60", c.targetBelow60);
+  prefs.putUShort("t60", c.target60);
+  prefs.putUShort("t70", c.target70);
+  prefs.putUShort("t80", c.target80);
+  prefs.putUShort("t90", c.target90);
+  prefs.putUShort("t100", c.target100);
+  prefs.putUShort("t120", c.target120);
+  prefs.putBool("canbEn", c.canbEnabled);
+  prefs.putBool("canbSvc", c.canbServiceModeEnabled);
+  prefs.putUChar("canbFiltMode", c.canbFilterMode);
+  prefs.putBool("canbFilt", c.canbFilterMode != CANB_FILTER_ALL);
+  prefs.putBool("hbStrobe", c.highBeamStrobeEnabled);
+  prefs.putBool("fogBrake", c.rearFogBrakeStrobeEnabled);
+  prefs.putBool("revStrobe", c.reverseStrobeEnabled);
+  prefs.putBool("batHeat", c.batteryPreheatEnabled);
+  prefs.putBool("lockSleep", c.lockDeepSleepEnabled);
+  prefs.putBool("gearSim", c.scrollGearSimEnabled);
+  prefs.putBool("gearInject", c.scrollGearInjectEnabled);
+  prefs.putBool("can1RxOnly", c.can1ReceiveOnly);
+  prefs.end();
+}
+
+static void setupLightWebUi() {
+  setupRecorderBuffer();
+  WiFi.mode(WIFI_AP);
+  // SoftAP IP / gateway = 100.100.1.1 (subnet 255.255.255.0). Must precede softAP().
+  WiFi.softAPConfig(IPAddress(100, 100, 1, 1), IPAddress(100, 100, 1, 1),
+                    IPAddress(255, 255, 255, 0));
+  WiFi.softAP(WEBUI_AP_SSID, WEBUI_AP_PASS);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/config", HTTP_POST, handleConfig);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/test", HTTP_POST, handleCanBTest);
+  server.on("/rec_start", HTTP_POST, handleRecStart);
+  server.on("/rec_stop", HTTP_POST, handleRecStop);
+  server.on("/rec_status", HTTP_GET, handleRecStatus);
+  server.on("/rec_download", HTTP_GET, handleRecDownload);
+  server.on("/web/off", HTTP_POST, handleWebOff);
+  server.begin();
+  webUiEnabled = true;
+}
+
+// Dedicated WebUI task (pinned to core 0, low priority). The CAN main loop on
+// core 1 never waits on this; HTTP is only serviced while the WebUI is enabled.
+static void webTask(void*) {
+  for (;;) {
+    if (webUiShutdownPending) {
+      delay(50);
+      server.stop();
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_OFF);
+      webUiEnabled = false;
+      webUiShutdownPending = false;
+    }
+    if (webUiEnabled) {
+      server.handleClient();
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+#endif  // ENABLE_LIGHT_WEBUI
+
+// ---- Main ----
 
 void setup() {
   pinMode(PIN_LED, OUTPUT);
 
   delay(500);
 
+#ifdef ENABLE_LIGHT_WEBUI
+  loadConfigFromPrefs();
+#endif
+
   // Configure TWAI (CAN) peripheral at 500 kbps
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+  twai_general_config_t g_config_twai = TWAI_GENERAL_CONFIG_DEFAULT(
     static_cast<gpio_num_t>(TWAI_TX_PIN),
     static_cast<gpio_num_t>(TWAI_RX_PIN),
     TWAI_MODE_NORMAL);
-  g_config.rx_queue_len = TWAI_RX_QUEUE_LEN;
-  g_config.tx_queue_len = TWAI_TX_QUEUE_LEN;
+  g_config_twai.rx_queue_len = TWAI_RX_QUEUE_LEN;
+  g_config_twai.tx_queue_len = TWAI_TX_QUEUE_LEN;
   twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_500KBITS();
   twai_filter_config_t  f_config = { CAN_ACCEPT_CODE, CAN_ACCEPT_MASK, true };
 
-  twai_driver_install(&g_config, &t_config, &f_config);
+  twai_driver_install(&g_config_twai, &t_config, &f_config);
   twai_start();
   twai_reconfigure_alerts(TWAI_ALERT_MASK, nullptr);
+
+#ifdef ENABLE_CANB_MCP2515
+  setupCanB();
+#endif
+
+#ifdef ENABLE_LIGHT_WEBUI
+  setupLightWebUi();
+  xTaskCreatePinnedToCore(webTask, "web", 4096, nullptr, 1, nullptr, 0);
+#endif
 }
 
 void loop() {
+  serviceLockDeepSleep();
   serviceTwaiAlerts();
+
+  bool didWork = false;
+
   can_frame frame;
-  if (!twai_recv(frame)) {
-    digitalWrite(PIN_LED, HIGH);
+  if (twai_recv(frame)) {
+    didWork = true;
+    digitalWrite(PIN_LED, LOW);
+    recordCanFrame(frame, 'R', 1);
+    handleBatteryTempDiagFrame(frame, 1);
+    RuntimeConfig cfg = configSnapshot();
+    speedLimitMonitor.update(frame);
+    handler.refreshUnifiedSpeedCompensation(cfg);
+    handler.handelMessage(frame, cfg);
+  }
+
+#ifdef ENABLE_CANB_MCP2515
+  RuntimeConfig canbCfg = configSnapshot();
+  if (canbCfg.canbEnabled) {
+    drainCanBWithBudget();
+    serviceCanBScheduledTx();
+    serviceHighBeamStrobe(canbCfg);
+    serviceReverseStrobe(canbCfg);
+    serviceRearFogBrakeStrobe(canbCfg);
+    serviceScrollGearShift(canbCfg);
+  } else {
+    serviceHighBeamStrobe(canbCfg);
+    serviceReverseStrobe(canbCfg);
+    serviceRearFogBrakeStrobe(canbCfg);
+    serviceScrollGearShift(canbCfg);
+  }
+#endif
+
+  if (lockDeepSleepPending) {
+    serviceLockDeepSleep();
     return;
   }
-  digitalWrite(PIN_LED, LOW);
-  speedLimitMonitor.update(frame);
-  handler.refreshUnifiedSpeedCompensation();
-  handler.handelMessage(frame);
+
+  serviceBatteryPreheat(configSnapshot());
+
+  if (!didWork) {
+    digitalWrite(PIN_LED, HIGH);
+  }
 }
+
