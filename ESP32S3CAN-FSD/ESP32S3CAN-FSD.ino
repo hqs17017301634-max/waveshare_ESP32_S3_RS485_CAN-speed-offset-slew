@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstring>
 #include <driver/twai.h>
+#include <esp_sleep.h>
 #ifdef ENABLE_LIGHT_WEBUI
 #include <esp_heap_caps.h>
 #endif
@@ -158,10 +159,11 @@ struct RuntimeConfig {
   bool highBeamStrobeEnabled = false; // arms double-pull flash-to-pass trigger
   bool rearFogBrakeStrobeEnabled = false; // arms brake-triggered 0x273 rear fog burst
   bool reverseStrobeEnabled = false;  // arms reverse-gear hazard + rear-fog burst
-  bool batteryPreheatEnabled = false; // sends UI_tripPlanning 0x082 every 1000 ms
+  bool batteryPreheatEnabled = false; // sends UI_tripPlanning 0x082 every 200 ms
   bool scrollGearSimEnabled = true;    // show brake + right-scroll D/R intent only
   bool scrollGearInjectEnabled = false; // experimental: inject 0x229 right-stalk D/R request
   bool can1ReceiveOnly = false;        // bus=1/TWAI/physical CANB RX-only: gate TWAI TX
+  bool lockDeepSleepEnabled = false;    // enter deep sleep immediately after a validated vehicle lock signal
 };
 
 static RuntimeConfig g_config;
@@ -197,6 +199,8 @@ struct RuntimeStatus {
   int batteryPreheatUiPowerW = 0;
   int batteryPreheatUiTargetCx100 = 0;
   int batteryPreheatUiAmbientCx100 = 0;
+  int batteryPreheatUiChargeTargetCx10 = 0;
+  int batteryPreheatUiEnergyAtDestination = 0;
   uint32_t batteryPreheatVehicleAgeMs = 0;
   uint8_t bmsTempFrameSeen = 0;
   uint32_t bmsTempFrameId = 0;
@@ -216,6 +220,11 @@ struct RuntimeStatus {
   uint8_t scrollGearInjectOk = 0;
   uint8_t scrollGearInjectBlocked = 0;
   int vehicleSpeedKph = 0;
+  uint8_t lockSleepArmed = 0;
+  uint8_t lockSleepTriggered = 0;
+  uint32_t lockSleepLastId = 0;
+  uint8_t lockSleepSource = 0; // 1=0x273 UI request, 2=0x339 VCSEC
+  uint32_t lockSleepAgeMs = 0;
 
   int fusedLimitKph = 0;
   int targetSpeedKph = 0;
@@ -363,6 +372,10 @@ static inline void recordCanFrame(const can_frame&, char, uint8_t) {}
 
 static bool twaiRecoveryInProgress = false;
 static uint32_t batteryPreheatLastSendMs = 0;
+static volatile bool canTxInhibitedForSleep = false;
+static bool lockDeepSleepPending = false;
+static uint32_t lockDeepSleepPendingMs = 0;
+static uint32_t lockSleepLastSignalMs = 0;
 
 static bool isRelevantCanId(uint32_t canId);
 static void serviceTwaiAlerts();
@@ -372,6 +385,7 @@ static bool canb_send(const can_frame& frame);
 #endif
 
 static bool twai_send(const can_frame& frame) {
+  if (canTxInhibitedForSleep) return false;
   if (g_config.can1ReceiveOnly) return false;  // bus=1/TWAI/physical CANB RX-only
   if (frame.can_dlc > 8) return false;
 
@@ -510,9 +524,9 @@ static inline bool isRelevantCanId(uint32_t canId) {
 // Battery-preheat 0x082 UI_tripPlanning. byte0 carries the active/nav/request
 // bits; byte1..7 are route/context fields that vary between captures. Keep a
 // valid vehicle frame as the template and only override byte0.
-static const uint8_t BATTERY_PREHEAT_FALLBACK[8] = {0x01, 0x50, 0x91, 0x33, 0xFF, 0x03, 0xEE, 0x04};
+static const uint8_t BATTERY_PREHEAT_FALLBACK[8] = {0x01, 0x50, 0xAC, 0x32, 0xFF, 0x03, 0x61, 0x15};
 constexpr uint32_t BATTERY_PREHEAT_PERIOD_MS = 200UL;
-static uint8_t batteryPreheatTemplate[8] = {0x01, 0x50, 0x91, 0x33, 0xFF, 0x03, 0xEE, 0x04};
+static uint8_t batteryPreheatTemplate[8] = {0x01, 0x50, 0xAC, 0x32, 0xFF, 0x03, 0x61, 0x15};
 static bool batteryPreheatTemplateValid = false;
 static uint8_t batteryPreheatOffFramesLeft = 0;
 static uint32_t batteryPreheatLastRxMs = 0;
@@ -540,7 +554,10 @@ static bool isUsableBatteryPreheatContext(const can_frame& frame) {
   return frame.data[1] != 0x7F &&
          frame.data[2] != 0xFF &&
          frame.data[3] != 0x80 &&
-         energyRaw != 0x8000;
+         frame.data[3] != 0xFF &&
+         energyRaw != 0x8000 &&
+         energyRaw != 0x8001 &&
+         energyRaw != 0xFFFF;
 }
 
 static void cacheBatteryPreheatTemplate(const can_frame& frame) {
@@ -553,7 +570,13 @@ static void cacheBatteryPreheatTemplate(const can_frame& frame) {
   g_status.batteryPreheatUiRequestHeat = (frame.data[0] >> 7) & 0x01;
   g_status.batteryPreheatUiPowerW = frame.data[1] == 0x7F ? -32768 : static_cast<int>(signedByte(frame.data[1])) * 125;
   g_status.batteryPreheatUiTargetCx100 = frame.data[2] == 0xFF ? -32768 : static_cast<int>(frame.data[2]) * 25;
-  g_status.batteryPreheatUiAmbientCx100 = frame.data[3] == 0x80 ? -32768 : static_cast<int>(signedByte(frame.data[3])) * 50;
+  g_status.batteryPreheatUiAmbientCx100 =
+      (frame.data[3] == 0x80 || frame.data[3] == 0xFF) ? -32768 : static_cast<int>(signedByte(frame.data[3])) * 50;
+  const uint16_t chargeTargetRaw = (static_cast<uint16_t>(frame.data[5] & 0x03) << 8) | frame.data[4];
+  const uint16_t energyRaw = (static_cast<uint16_t>(frame.data[7]) << 8) | frame.data[6];
+  g_status.batteryPreheatUiChargeTargetCx10 = chargeTargetRaw == 0x03FF ? -32768 : static_cast<int>(chargeTargetRaw);
+  g_status.batteryPreheatUiEnergyAtDestination =
+      (energyRaw == 0x8000 || energyRaw == 0x8001 || energyRaw == 0xFFFF) ? -32768 : static_cast<int>(static_cast<int16_t>(energyRaw));
   if (!isUsableBatteryPreheatContext(frame)) return;
   memcpy(batteryPreheatTemplate, frame.data, 8);
   batteryPreheatTemplate[0] = 0x01;
@@ -868,6 +891,7 @@ static volatile uint32_t canbLastServiceBurstMs = 0;
 constexpr uint32_t CANB_ID_SCCM_RIGHT_STALK = 0x229;
 constexpr uint32_t CANB_ID_STW_ACTN_RQ = 0x249;
 constexpr uint32_t CANB_ID_BODY_LIGHTING = 0x273;
+constexpr uint32_t CANB_ID_VCSEC_STATUS = 0x339;
 constexpr uint32_t CANB_ID_LIGHTING_STATUS = 0x3F5;
 // 0x3C2 VCLEFT_switchStatus: byte0 bit3 = hazardButtonPressed; data[3] bits0..5
 // = VCLEFT_swcRightScrollTicks (6-bit signed, + forward / - back).
@@ -1002,6 +1026,7 @@ static void serviceReverseStrobe(const RuntimeConfig& cfg);
 static void serviceRearFogBrakeStrobe(const RuntimeConfig& cfg);
 static void serviceScrollGearShift(const RuntimeConfig& cfg);
 static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig& cfg, bool cacheHazardFrame);
+static void serviceLockDeepSleep();
 
 static void setupCanB() {
   canbReady = false;
@@ -1038,7 +1063,7 @@ static bool applyCanBFilters(uint8_t mode) {
     if (canb.setFilter(MCP2515::RXF1, false, CANB_ID_BODY_LIGHTING) != MCP2515::ERROR_OK) return false;
 
     if (canb.setFilterMask(MCP2515::MASK1, false, 0x7FF) != MCP2515::ERROR_OK) return false;
-    if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_LIGHTING_STATUS) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_VCSEC_STATUS) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_SCCM_RIGHT_STALK) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF4, false, CAN_ID_UI_TRIP_PLANNING) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
@@ -1051,7 +1076,7 @@ static bool applyCanBFilters(uint8_t mode) {
     if (canb.setFilter(MCP2515::RXF2, false, CANB_ID_SCCM_RIGHT_STALK) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF3, false, CANB_ID_VCLEFT_SWITCH) != MCP2515::ERROR_OK) return false;
     if (canb.setFilter(MCP2515::RXF4, false, CAN_ID_UI_TRIP_PLANNING) != MCP2515::ERROR_OK) return false;
-    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_BODY_LIGHTING) != MCP2515::ERROR_OK) return false;
+    if (canb.setFilter(MCP2515::RXF5, false, CANB_ID_VCSEC_STATUS) != MCP2515::ERROR_OK) return false;
   } else {
     if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
     // WebUI 鍏抽棴杩囨护锛歮ask=0 鎺ユ敹鍏ㄩ儴鏍囧噯甯э紝鏂逛究瀹炶溅鎶撳寘/璋冭瘯鏂?ID銆?    if (canb.setFilterMask(MCP2515::MASK0, false, 0x000) != MCP2515::ERROR_OK) return false;
@@ -1088,6 +1113,7 @@ static bool canb_recv(can_frame& frame) {
 }
 
 static bool canb_send(const can_frame& frame) {
+  if (canTxInhibitedForSleep) return false;
   if (!canbReady) return false;
   if (frame.can_dlc > 8) return false;
   // One short retry on a busy/failed mailbox; no blocking delay so a stuck
@@ -1417,6 +1443,71 @@ static bool readSignedBitsLE(const can_frame& frame, uint8_t startBit, uint8_t l
   }
   value = static_cast<int32_t>(raw);
   return true;
+}
+
+static bool lockSleepVcsecStatusLocked(uint8_t status) {
+  return status == 2 || status == 5 || status == 8 ||
+         status == 10 || status == 12 || status == 15;
+}
+
+static bool isVehicleLockSignal(const can_frame& frame, uint8_t& source) {
+  uint32_t raw = 0;
+  if (frame.can_id == CANB_ID_BODY_LIGHTING && frame.can_dlc >= 3) {
+    if (!readBitsLE(frame, 17, 3, raw)) return false;
+    const uint8_t lockRequest = static_cast<uint8_t>(raw);
+    if (lockRequest == 1 || lockRequest == 4) {
+      source = 1;
+      return true;
+    }
+  } else if (frame.can_id == CANB_ID_VCSEC_STATUS && frame.can_dlc >= 8) {
+    uint32_t vehicleLockStatus = 0;
+    uint32_t simpleLockStatus = 0;
+    if (!readBitsLE(frame, 12, 4, vehicleLockStatus)) return false;
+    if (!readBitsLE(frame, 54, 2, simpleLockStatus)) return false;
+    if (simpleLockStatus == 2 || lockSleepVcsecStatusLocked(static_cast<uint8_t>(vehicleLockStatus))) {
+      source = 2;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void requestLockDeepSleep(const can_frame& frame, uint8_t source) {
+  if (!g_config.lockDeepSleepEnabled || lockDeepSleepPending) return;
+  canTxInhibitedForSleep = true;
+  lockDeepSleepPending = true;
+  lockDeepSleepPendingMs = millis();
+  lockSleepLastSignalMs = lockDeepSleepPendingMs;
+  g_status.lockSleepTriggered = 1;
+  g_status.lockSleepLastId = frame.can_id;
+  g_status.lockSleepSource = source;
+}
+
+static void serviceLockDeepSleep() {
+  if (!lockDeepSleepPending) return;
+  const uint32_t now = millis();
+  if (now - lockDeepSleepPendingMs < 50) return;
+
+  canTxInhibitedForSleep = true;
+  g_status.highBeamStrobeActive = 0;
+  g_status.highBeamStrobeRemaining = 0;
+  g_status.rearFogBrakeStrobeActive = 0;
+  g_status.rearFogBrakeStrobeRemaining = 0;
+  g_status.reverseStrobeActive = 0;
+  g_status.reverseStrobeRemaining = 0;
+  g_status.batteryPreheatActive = 0;
+  g_status.scrollGearInjectActive = 0;
+
+#ifdef ENABLE_LIGHT_WEBUI
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+#endif
+
+  twai_stop();
+  twai_driver_uninstall();
+  digitalWrite(PIN_LED, HIGH);
+  delay(20);
+  esp_deep_sleep_start();
 }
 
 static void handleBatteryTempDiagFrame(const can_frame& frame, uint8_t bus) {
@@ -1796,6 +1887,15 @@ static void handleVcleftSwitchFrame(const can_frame& frame, const RuntimeConfig&
 static void handleCanBFrame(const can_frame& frame) {
   // Stage 1: statistics only. No heavy work, no Serial, no JSON, no bridging.
   canbLastId = frame.can_id;
+  uint8_t lockSource = 0;
+  if (isVehicleLockSignal(frame, lockSource)) {
+    lockSleepLastSignalMs = millis();
+    g_status.lockSleepLastId = frame.can_id;
+    g_status.lockSleepSource = lockSource;
+    requestLockDeepSleep(frame, lockSource);
+    if (lockDeepSleepPending) return;
+  }
+
   if (frame.can_id == CANB_ID_STW_ACTN_RQ && frame.can_dlc >= 2) {
     canbLastStwActnRqFrame = frame;
     canbHasLastStwActnRqFrame = true;
@@ -1917,6 +2017,7 @@ static void drainCanBWithBudget() {
     can_frame frame;
     if (!canb_recv(frame)) break;
     handleCanBFrame(frame);
+    if (lockDeepSleepPending) break;
     if ((micros() - startUs) >= CANB_RX_DRAIN_TIME_US) break;
   }
   updateCanBErrorStatus();
@@ -1985,6 +2086,8 @@ static void handleStatus() {
   const uint32_t now = millis();
   s.batteryPreheatVehicleAgeMs = batteryPreheatLastRxMs == 0 ? 0 : (now - batteryPreheatLastRxMs);
   s.bmsTempFrameAgeMs = bmsTempLastRxMs == 0 ? 0 : (now - bmsTempLastRxMs);
+  s.lockSleepArmed = c.lockDeepSleepEnabled ? 1 : 0;
+  s.lockSleepAgeMs = lockSleepLastSignalMs == 0 ? 0 : (now - lockSleepLastSignalMs);
 
   String j;
   j.reserve(2400);
@@ -2017,6 +2120,7 @@ static void handleStatus() {
   j += ",\"rearFogBrakeStrobeEnabled\":"; j += c.rearFogBrakeStrobeEnabled ? 1 : 0;
   j += ",\"reverseStrobeEnabled\":"; j += c.reverseStrobeEnabled ? 1 : 0;
   j += ",\"batteryPreheatEnabled\":"; j += c.batteryPreheatEnabled ? 1 : 0;
+  j += ",\"lockDeepSleepEnabled\":"; j += c.lockDeepSleepEnabled ? 1 : 0;
   j += ",\"scrollGearSimEnabled\":"; j += c.scrollGearSimEnabled ? 1 : 0;
   j += ",\"scrollGearInjectEnabled\":"; j += c.scrollGearInjectEnabled ? 1 : 0;
   j += ",\"can1ReceiveOnly\":"; j += c.can1ReceiveOnly ? 1 : 0;
@@ -2048,6 +2152,8 @@ static void handleStatus() {
   j += ",\"batteryPreheatUiPowerW\":"; j += s.batteryPreheatUiPowerW;
   j += ",\"batteryPreheatUiTargetCx100\":"; j += s.batteryPreheatUiTargetCx100;
   j += ",\"batteryPreheatUiAmbientCx100\":"; j += s.batteryPreheatUiAmbientCx100;
+  j += ",\"batteryPreheatUiChargeTargetCx10\":"; j += s.batteryPreheatUiChargeTargetCx10;
+  j += ",\"batteryPreheatUiEnergyAtDestination\":"; j += s.batteryPreheatUiEnergyAtDestination;
   j += ",\"batteryPreheatVehicleAgeMs\":"; j += s.batteryPreheatVehicleAgeMs;
   j += ",\"bmsTempFrameSeen\":"; j += s.bmsTempFrameSeen;
   j += ",\"bmsTempFrameId\":"; j += s.bmsTempFrameId;
@@ -2055,6 +2161,11 @@ static void handleStatus() {
   j += ",\"bmsTempFrameMux\":"; j += s.bmsTempFrameMux;
   j += ",\"bmsTempFrameAgeMs\":"; j += s.bmsTempFrameAgeMs;
   j += ",\"bmsTempFramePayload\":\""; j += s.bmsTempFramePayload; j += '"';
+  j += ",\"lockSleepArmed\":"; j += s.lockSleepArmed;
+  j += ",\"lockSleepTriggered\":"; j += s.lockSleepTriggered;
+  j += ",\"lockSleepLastId\":"; j += s.lockSleepLastId;
+  j += ",\"lockSleepSource\":"; j += s.lockSleepSource;
+  j += ",\"lockSleepAgeMs\":"; j += s.lockSleepAgeMs;
   j += ",\"rightScrollTicks\":";     j += s.rightScrollTicks;
   j += ",\"rightStalkStatus\":";     j += s.rightStalkStatus;
   j += ",\"rightStalkCounter\":";    j += s.rightStalkCounter;
@@ -2117,6 +2228,7 @@ static void handleConfig() {
   c.rearFogBrakeStrobeEnabled = argBool("rearFogBrakeStrobeEnabled", c.rearFogBrakeStrobeEnabled);
   c.reverseStrobeEnabled    = argBool("reverseStrobeEnabled", c.reverseStrobeEnabled);
   c.batteryPreheatEnabled   = argBool("batteryPreheatEnabled", c.batteryPreheatEnabled);
+  c.lockDeepSleepEnabled    = argBool("lockDeepSleepEnabled", c.lockDeepSleepEnabled);
   c.scrollGearSimEnabled    = argBool("scrollGearSimEnabled", c.scrollGearSimEnabled);
   c.scrollGearInjectEnabled = argBool("scrollGearInjectEnabled", c.scrollGearInjectEnabled);
   c.can1ReceiveOnly        = argBool("can1ReceiveOnly", c.can1ReceiveOnly);
@@ -2376,6 +2488,7 @@ static void loadConfigFromPrefs() {
   c.rearFogBrakeStrobeEnabled = prefs.getBool("fogBrake", c.rearFogBrakeStrobeEnabled);
   c.reverseStrobeEnabled   = prefs.getBool("revStrobe", c.reverseStrobeEnabled);
   c.batteryPreheatEnabled  = prefs.getBool("batHeat", c.batteryPreheatEnabled);
+  c.lockDeepSleepEnabled   = prefs.getBool("lockSleep", c.lockDeepSleepEnabled);
   c.scrollGearSimEnabled   = prefs.getBool("gearSim", c.scrollGearSimEnabled);
   c.scrollGearInjectEnabled = prefs.getBool("gearInject", c.scrollGearInjectEnabled);
   c.can1ReceiveOnly        = prefs.getBool("can1RxOnly", c.can1ReceiveOnly);
@@ -2409,6 +2522,7 @@ static void saveConfigToPrefs() {
   prefs.putBool("fogBrake", c.rearFogBrakeStrobeEnabled);
   prefs.putBool("revStrobe", c.reverseStrobeEnabled);
   prefs.putBool("batHeat", c.batteryPreheatEnabled);
+  prefs.putBool("lockSleep", c.lockDeepSleepEnabled);
   prefs.putBool("gearSim", c.scrollGearSimEnabled);
   prefs.putBool("gearInject", c.scrollGearInjectEnabled);
   prefs.putBool("can1RxOnly", c.can1ReceiveOnly);
@@ -2493,6 +2607,7 @@ void setup() {
 }
 
 void loop() {
+  serviceLockDeepSleep();
   serviceTwaiAlerts();
 
   bool didWork = false;
@@ -2525,6 +2640,11 @@ void loop() {
     serviceScrollGearShift(canbCfg);
   }
 #endif
+
+  if (lockDeepSleepPending) {
+    serviceLockDeepSleep();
+    return;
+  }
 
   serviceBatteryPreheat(configSnapshot());
 
